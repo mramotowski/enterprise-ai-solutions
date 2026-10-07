@@ -1,0 +1,151 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Validate
+#
+#   internal  checks the release, the server pods and the TLS Secrets, then
+#             (read-only, through files/bootstrap.sh status in pod 0) that every
+#             pod is initialized and unsealed and the bootstrap markers exist
+#             (KV mount, auth/kubernetes, AD-7 roles)
+#   external  external_checks.yaml: health, roles, operator login, KV v2 mount
+#             and audit device of the operator's OpenBao; writes nothing but
+#             revoke-self of its own token
+# Both: the CA bundle ConfigMap exists.
+
+# Resolves the mode and the names the checks need (cluster id, layers, peers).
+- name: "openbao | validate | Preflight"
+  ansible.builtin.include_tasks: preflight.yaml
+
+- name: "openbao | validate | Check the CA bundle ConfigMap"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: "{{ openbao_ca_bundle_configmap }}"
+    namespace: "{{ openbao_namespace }}"
+  register: _openbao_ca_bundle_cm
+
+- name: "openbao | validate | Assert the CA bundle ConfigMap holds a certificate"
+  ansible.builtin.assert:
+    that:
+      - _openbao_ca_bundle_cm.resources | default([]) | length == 1
+      - "'-----BEGIN CERTIFICATE-----' in (_openbao_ca_bundle_cm.resources[0].data | default({})).get('ca.crt', '')"
+    fail_msg: >-
+      ConfigMap {{ openbao_namespace }}/{{ openbao_ca_bundle_configmap }} (key ca.crt, the OpenBao CA)
+      is missing or empty. Re-run ./es_auto_installer.sh install platform --env {{ env_name | default('<env>') }}.
+    success_msg: "CA bundle ConfigMap {{ openbao_ca_bundle_configmap }} present"
+
+- name: "openbao | validate | External OpenBao"
+  ansible.builtin.include_tasks: external_checks.yaml
+  when: _openbao_external | bool
+
+- name: "openbao | validate | Internal OpenBao"
+  when: not (_openbao_external | bool)
+  block:
+    - name: "openbao | validate | Check Helm release"
+      kubernetes.core.helm_info:
+        name: "{{ openbao_helm_release_name }}"
+        release_namespace: "{{ openbao_namespace }}"
+      register: _openbao_release
+
+    - name: "openbao | validate | Assert Helm release is deployed"
+      ansible.builtin.assert:
+        that:
+          - _openbao_release.status is defined
+          - (_openbao_release.status.status | default('') | lower) == 'deployed'
+        fail_msg: >-
+          OpenBao Helm release '{{ openbao_helm_release_name }}' is not deployed in namespace
+          {{ openbao_namespace }} (status: {{ _openbao_release.status.status | default('not installed') }}).
+        success_msg: "OpenBao Helm release deployed"
+
+    - name: "openbao | validate | Check server pods"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ openbao_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=openbao"
+          - "app.kubernetes.io/instance={{ openbao_helm_release_name }}"
+          - "component=server"
+      register: _openbao_pods
+
+    - name: "openbao | validate | Assert all server pods are Running"
+      ansible.builtin.assert:
+        that:
+          - (_openbao_healthy_pod_count | int) == (openbao_replicas | int)
+        fail_msg: >-
+          {{ _openbao_healthy_pod_count }} of {{ openbao_replicas }} OpenBao server pod(s) in
+          {{ openbao_namespace }} are Running with the openbao container running and at most
+          {{ openbao_pods_max_restarts }} restart(s).
+        success_msg: "{{ _openbao_healthy_pod_count }} OpenBao server pod(s) Running"
+
+    - name: "openbao | validate | Check TLS Secrets"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ item }}"
+        namespace: "{{ openbao_namespace }}"
+      register: _openbao_tls_secrets
+      loop:
+        - "{{ openbao_tls_ca_secret_name }}"
+        - "{{ openbao_tls_server_secret_name }}"
+      no_log: true
+
+    - name: "openbao | validate | Assert CA and server-cert Secrets exist"
+      vars:
+        _missing: >-
+          {{ _openbao_tls_secrets.results | rejectattr('resources') | map(attribute='item') | list }}
+      ansible.builtin.assert:
+        that:
+          - _missing | length == 0
+        fail_msg: "Missing TLS Secret(s) in {{ openbao_namespace }}: {{ _missing | join(', ') }}"
+        success_msg: "TLS Secrets present: {{ openbao_tls_ca_secret_name }}, {{ openbao_tls_server_secret_name }}"
+
+    - name: "openbao | validate | Read init, seal and bootstrap state"
+      ansible.builtin.include_tasks: bootstrap_exec.yaml
+      vars:
+        _openbao_bootstrap_mode: status
+
+    - name: "openbao | validate | Fail unless initialized, unsealed and bootstrapped"
+      ansible.builtin.include_tasks: state_fail.yaml
+
+    - name: "openbao | validate | Every pod serves the current listener certificate"
+      ansible.builtin.include_tasks: tls_reload.yaml
+      vars:
+        _openbao_tls_mode: check
+
+    - name: "openbao | validate | Read the StatefulSet revision"
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: StatefulSet
+        name: "{{ openbao_fullname }}"
+        namespace: "{{ openbao_namespace }}"
+      register: _openbao_val_sts
+
+    # Not a failure: OnDelete keeps old pods until an upgrade restarts them.
+    - name: "openbao | validate | Pods waiting for an upgrade"
+      vars:
+        _rev: "{{ (_openbao_val_sts.resources | default([{}]) | first).status.updateRevision | default('') }}"
+        _old: >-
+          {{ _openbao_pods.resources | default([])
+             | rejectattr('metadata.labels.controller-revision-hash', 'defined') | map(attribute='metadata.name') | list
+             + (_openbao_pods.resources | default([]) | selectattr('metadata.labels.controller-revision-hash', 'defined')
+                | rejectattr('metadata.labels.controller-revision-hash', 'eq', _rev) | map(attribute='metadata.name') | list) }}
+        _no_reloader: >-
+          {% set r = [] %}{% for p in _openbao_pods.resources | default([]) %}{% if 'tls-reloader' not in
+          (p.spec.containers | default([]) | map(attribute='name') | list) %}{% set _ = r.append(p.metadata.name) %}{% endif %}{%
+          endfor %}{{ r }}
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ (_old + (_no_reloader if openbao_tls_reloader_enabled | bool else [])) | unique | join(', ') }}
+          run(s) an older pod template{{ ' (no tls-reloader sidecar: a renewed server certificate is served only after install/upgrade or a manual SIGHUP)' if (openbao_tls_reloader_enabled | bool) and _no_reloader | length > 0 else '' }}.
+          Restart them with ./es_auto_installer.sh install openbao --env {{ env_name | default('<env>') }} --only
+          -- -e openbao_upgrade=true (docs/deploy/openbao.md, "Upgrades").
+      when: (_old + (_no_reloader if openbao_tls_reloader_enabled | bool else [])) | length > 0
+
+    - name: "openbao | validate | OpenBao ready"
+      ansible.builtin.debug:
+        msg: >-
+          OpenBao initialized, unsealed on all {{ openbao_replicas }} pod(s), bootstrap markers
+          present (KV '{{ openbao_kv_mount }}', auth/kubernetes, roles for
+          {{ openbao_layers | join(', ') }}, operator, backup).

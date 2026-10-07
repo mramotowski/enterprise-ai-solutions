@@ -1,0 +1,91 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One row of external_test.yaml: preflight.yaml + external_checks.yaml against
+# a test container.
+# Input: _row {name, container, vars (overrides), policies (token to mint, or
+# none), expect (regex of the failure; '' = must pass), login_tasks and
+# path_prefix (optional: the real external_login.yaml with a kubectl shim)}.
+
+- name: "openbao | external test | {{ _row.name }} | Reset"
+  ansible.builtin.set_fact:
+    _row_failed: false
+    _row_msg: ""
+    _test_token: ""
+    _openbao_ext_token: ""
+
+- name: "openbao | external test | {{ _row.name }} | Mint a token ({{ _row.policies | default([]) | join(',') }})"
+  ansible.builtin.include_tasks: _external_bao.yaml
+  vars:
+    _bao: {container: "{{ _row.container }}", cmd: "bao token create -ttl=10m -field=token {{ _row.policies | map('regex_replace', '^', '-policy=') | join(' ') }}"}
+  when: _row.policies | default([]) | length > 0
+
+- name: "openbao | external test | {{ _row.name }} | Keep the token"
+  ansible.builtin.set_fact:
+    _test_token: "{{ _bao_out | trim }}"
+  when: _row.policies | default([]) | length > 0
+  no_log: true
+
+- name: "openbao | external test | {{ _row.name }} | Run the checks"
+  # Rows with a kubectl shim put it first on PATH.
+  environment: "{{ {'PATH': _row.path_prefix ~ ':' ~ lookup('ansible.builtin.env', 'PATH')} if _row.path_prefix is defined else {} }}"
+  block:
+    - name: "openbao | external test | {{ _row.name }} | preflight.yaml"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: preflight.yaml
+      vars: &row_vars
+        openbao_mode: external
+        openbao_address: "{{ _row.vars.openbao_address | default('https://127.0.0.1:' ~ _ports[_row.container]) }}"
+        openbao_ca_file: "{{ _row.vars.openbao_ca_file | default(_tmp.path ~ '/certs/ca.crt') }}"
+        openbao_cluster_id: "{{ _test_cid }}"
+        openbao_kv_mount: "{{ _row.vars.openbao_kv_mount | default('intel-ai') }}"
+        openbao_auth_mount: "{{ _row.vars.openbao_auth_mount | default('kubernetes') }}"
+        openbao_external_use_proxy: false
+        openbao_external_timeout: 5
+        _openbao_external_login_tasks: "{{ _row.login_tasks | default(playbook_dir ~ '/_external_login_stub.yaml') }}"
+
+    - name: "openbao | external test | {{ _row.name }} | external_checks.yaml"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: external_checks.yaml
+      vars: *row_vars
+  rescue:
+    - name: "openbao | external test | {{ _row.name }} | Record failure"
+      ansible.builtin.set_fact:
+        _row_failed: true
+        _row_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "openbao | external test | {{ _row.name }} | Assert the outcome"
+  ansible.builtin.assert:
+    that:
+      - _row_failed == (_row.expect != '')
+      - _row.expect == '' or _row_msg is search(_row.expect)
+    fail_msg: "{{ _row.name }}: expected {{ ('failure /' ~ _row.expect ~ '/') if _row.expect else 'success' }}, got failed={{ _row_failed }}: {{ _row_msg }}"
+    quiet: true
+
+# The installer revokes its own token in an always block, pass or fail.
+- name: "openbao | external test | {{ _row.name }} | Look the token up"
+  ansible.builtin.command:
+    argv: [docker, exec, -i, "{{ _row.container }}", /bin/sh, -c, "read -r BAO_TOKEN; export BAO_TOKEN; bao token lookup >/dev/null 2>&1"]
+    stdin: "{{ _test_token }}"
+  register: _row_lookup
+  changed_when: false
+  failed_when: false
+  when: (_row.policies | default([]) | length > 0) and (_row.revoked | default(true))
+  no_log: true
+
+- name: "openbao | external test | {{ _row.name }} | Assert the token was revoked"
+  ansible.builtin.assert:
+    that:
+      - _row_lookup.rc != 0
+    fail_msg: "{{ _row.name }}: the minted token still works after external_checks.yaml"
+    quiet: true
+  when: (_row.policies | default([]) | length > 0) and (_row.revoked | default(true))
+
+- name: "openbao | external test | {{ _row.name }} | Forget the token"
+  ansible.builtin.set_fact:
+    _test_token: ""
+    _row_lookup: {}
+  no_log: true

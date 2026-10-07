@@ -1,0 +1,217 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Defaults
+#
+# Role-internal settings only. The backend switch and openbao_* config keys live
+# in global_config.yaml (secrets_backend, openbao_mode, openbao_address,
+# openbao_auth_mount, ...).
+
+openbao_namespace: "openbao"
+openbao_helm_release_name: "openbao"
+openbao_chart_repo_url: "https://openbao.github.io/openbao-helm"
+openbao_chart_version: "0.30.0"
+
+# Chart fullname. Pinned through fullnameOverride so Service, StatefulSet and
+# pod DNS names (and the server cert SANs built from them) never depend on the
+# chart's release-name heuristic.
+openbao_fullname: "{{ openbao_helm_release_name }}"
+
+# Server image (the chart's appVersion for chart 0.30.0), set explicitly so the
+# cert reloader sidecar and the snapshot Job run the very same bao CLI.
+openbao_image_registry: "quay.io"
+openbao_image_repository: "openbao/openbao"
+openbao_image_tag: "2.7.0"
+openbao_image: "{{ openbao_image_registry }}/{{ openbao_image_repository }}:{{ openbao_image_tag }}"
+
+# --- Storage ------------------------------------------------------------------
+openbao_storage_size: "10Gi"
+openbao_storage_class: ""                 # empty = cluster default StorageClass
+
+# --- Listener TLS (internal mode) -----------------------------------------------
+# cert-manager chain owned by this role, all in openbao_namespace:
+#   selfSigned Issuer -> CA Certificate (Secret openbao-ca) -> CA Issuer ->
+#   server Certificate (Secret openbao-server-tls). Clients trust openbao-ca.
+openbao_tls_bootstrap_issuer_name: "openbao-selfsigned"
+openbao_tls_ca_cert_name: "openbao-ca"
+openbao_tls_ca_secret_name: "openbao-ca"
+openbao_tls_ca_issuer_name: "openbao-ca-issuer"
+openbao_tls_ca_common_name: "openbao-ca"
+openbao_tls_ca_duration: "87600h"         # 10 years
+openbao_tls_ca_renew_before: "720h"
+openbao_tls_server_cert_name: "openbao-server-tls"
+openbao_tls_server_secret_name: "openbao-server-tls"
+openbao_tls_server_duration: "8760h"      # 1 year
+openbao_tls_server_renew_before: "720h"
+openbao_cluster_domain: "cluster.local"
+# Where the chart mounts the server-cert Secret (server.extraVolumes, type secret).
+openbao_tls_mount_dir: "/openbao/userconfig/{{ openbao_tls_server_secret_name }}"
+
+# --- Waits ----------------------------------------------------------------------
+openbao_tls_wait_retries: 30
+openbao_tls_wait_delay: 5
+openbao_pods_wait_retries: 60
+openbao_pods_wait_delay: 5
+# A server pod counts as healthy when it is Running, its openbao container is
+# running and has restarted at most this often (Running alone hides CrashLoopBackOff).
+openbao_pods_max_restarts: 2
+# Server pods with phase Running, container 'openbao' running and restartCount
+# <= openbao_pods_max_restarts. Evaluated lazily against _openbao_pods.
+_openbao_healthy_pod_count: >-
+  {% set n = namespace(c=0) %}{% for p in _openbao_pods.resources | default([])
+  if (p.status.phase | default('')) == 'Running' %}{% for c in p.status.containerStatuses | default([])
+  if c.name == 'openbao' and c.state.running is defined
+  and (c.restartCount | default(0) | int) <= (openbao_pods_max_restarts | int) %}{% set n.c = n.c + 1 %}{% endfor %}{% endfor %}{{ n.c }}
+
+# --- Init, unseal and bootstrap (tasks/init.yaml, files/bootstrap.sh) ---------
+# Shamir split of the unseal key: any openbao_key_threshold of the
+# openbao_key_shares shares unseal OpenBao. Shown once, on the terminal running the installer, at init.
+openbao_key_shares: 5
+openbao_key_threshold: 3
+# Kubernetes-auth roles 'operator' (people, via port-forward/route) and 'backup'
+# (the raft snapshot Job), shared by every layer (AD-7).
+openbao_operator_sa: "openbao-operator"
+openbao_operator_namespace: "{{ openbao_namespace }}"
+openbao_operator_token_ttl: "1h"
+openbao_backup_sa: "openbao-snapshot"
+# Its own namespace, holding only the snapshot PVC, the snapshot Job and what
+# the Job mounts: backup profiles capture this namespace, never openbao_namespace
+# (a restore would delete the live Raft PVCs and replay the chart's objects).
+openbao_backup_namespace: "openbao-backup"
+# Seconds bootstrap.sh waits for each pod to unseal and for pod 0 to become active.
+openbao_init_timeout: 120
+# kubernetes_host of auth/kubernetes (token reviews go to the in-cluster API).
+openbao_k8s_host: "https://kubernetes.default.svc"
+# ConfigMap holding files/bootstrap.sh, mounted read-only into the server pods
+# (chart extraVolumes: /openbao/userconfig/<name>/).
+openbao_bootstrap_configmap: "openbao-bootstrap"
+openbao_bootstrap_script_path: "/openbao/userconfig/{{ openbao_bootstrap_configmap }}/bootstrap.sh"
+# The k8s_exec command for tasks/bootstrap_exec.yaml (evaluated lazily with
+# _openbao_bootstrap_mode set). k8s_exec takes one string and shlex-splits it,
+# so every piece is quoted; only non-secret values, as env and args.
+_openbao_bootstrap_env:
+  OB_KEY_SHARES: "{{ openbao_key_shares | int }}"
+  OB_KEY_THRESHOLD: "{{ openbao_key_threshold | int }}"
+  OB_KV_MOUNT: "{{ openbao_kv_mount }}"
+  OB_CLUSTER_ID: "{{ _openbao_cluster_id }}"
+  OB_AUDIENCE: "{{ openbao_auth_audience }}"
+  OB_ESO_SA: "{{ _openbao_eso_sa }}"
+  OB_ESO_NAMESPACE: "{{ _openbao_eso_namespace }}"
+  OB_OPERATOR_SA: "{{ openbao_operator_sa }}"
+  OB_OPERATOR_NAMESPACE: "{{ openbao_operator_namespace }}"
+  OB_OPERATOR_TOKEN_TTL: "{{ openbao_operator_token_ttl }}"
+  OB_BACKUP_SA: "{{ openbao_backup_sa }}"
+  OB_BACKUP_NAMESPACE: "{{ openbao_backup_namespace }}"
+  OB_PEER_ADDRS: "{{ _openbao_peer_addrs | join(' ') }}"
+  OB_TIMEOUT: "{{ openbao_init_timeout | int }}"
+  OB_K8S_HOST: "{{ openbao_k8s_host }}"
+_openbao_bootstrap_cmd: >-
+  env {% for k, v in _openbao_bootstrap_env.items() %}{{ (k ~ '=' ~ v) | quote }} {% endfor %}/bin/sh
+  {{ openbao_bootstrap_script_path | quote }} {{ _openbao_bootstrap_mode | quote }}
+  {{ _openbao_layer_specs | map('quote') | join(' ') }}
+# The same command in apply mode (files/bootstrap.sh apply): printed for the
+# operator, who pipes a temporary generate-root token into it inside pod 0
+# (docs/deploy/openbao.md, "Change the bootstrap (generate-root)"). The installer
+# never runs it and never handles that token.
+_openbao_bootstrap_apply_cmd: >-
+  env {% for k, v in _openbao_bootstrap_env.items() if k not in ['OB_KEY_SHARES', 'OB_KEY_THRESHOLD'] %}{{ (k ~ '=' ~ v) | quote }} {% endfor %}/bin/sh
+  {{ openbao_bootstrap_script_path | quote }} apply
+  {{ _openbao_layer_specs | map('quote') | join(' ') }}
+# Path of the file audit device declared in the server config (to stdout).
+openbao_audit_path: "file"
+
+# --- Server certificate reload (files/tls-reload.sh) ----------------------------
+# OpenBao reads tls_cert_file only at start and on SIGHUP. The sidecar
+# 'tls-reloader' (same image, shared process namespace, no ports, no API rights)
+# compares the served certificate with the mounted one every interval seconds
+# and sends SIGHUP to the bao server process when cert-manager renewed it.
+# Install and upgrade also heal every pod once; validate fails on a stale one.
+openbao_tls_reloader_enabled: true
+openbao_tls_reloader_interval: 60
+openbao_tls_reload_script_path: "/openbao/userconfig/{{ openbao_bootstrap_configmap }}/tls-reload.sh"
+openbao_tls_reloader_resources:
+  requests: {cpu: "5m", memory: "16Mi"}
+  limits: {memory: "64Mi"}
+
+# --- Upgrade and replica changes (tasks/rollout.yaml, replicas_guard.yaml) -----
+# true: after the chart upgrade, restart every pod that runs an old revision,
+# one at a time (standbys first, the active pod last), and wait for the
+# operator to unseal each (and every new pod after a scale-up). Set by the
+# upgrade action; with the CLI: install openbao --only -- -e openbao_upgrade=true.
+openbao_upgrade: false
+# After the pause, how long to wait for a pod to report unsealed and joined.
+openbao_upgrade_unseal_retries: 60
+openbao_upgrade_unseal_delay: 5
+# Lowering openbao_replicas is refused unless the Raft peers of the removed
+# pods were removed first (bao operator raft remove-peer, runbook "Scale down").
+openbao_raft_peers_removed: false
+
+# --- Raft snapshot backup hook (tasks/snapshot_backup.yaml, snapshot_restore.yaml) -
+# Profile hooks {kind: role, role: openbao, tasks_from: snapshot_backup.yaml}
+# (pre_backup) and snapshot_restore.yaml (post_restore). A Job in
+# openbao_backup_namespace logs in as role 'backup' and writes the snapshot to
+# this PVC; the backup captures the namespace. Nothing passes the installer host.
+openbao_snapshot_pvc: "openbao-snapshot"
+openbao_snapshot_storage_size: "{{ openbao_storage_size }}"
+openbao_snapshot_script_configmap: "openbao-snapshot"
+openbao_snapshot_job_name: "openbao-snapshot"
+# Seconds the Job may run (activeDeadlineSeconds). The hook waits that long
+# plus a margin, so it never gives up on a Job Kubernetes still runs.
+openbao_snapshot_job_timeout: 600
+openbao_snapshot_wait_delay: 5
+openbao_snapshot_wait_retries: "{{ ((openbao_snapshot_job_timeout | int) + 120) // (openbao_snapshot_wait_delay | int) }}"
+# Lifetime of the projected ServiceAccount token the Job logs in with.
+openbao_snapshot_token_seconds: 600
+# After a restore: annotate every ExternalSecret on an openbao-* store with
+# force-sync, so projected Secrets match the restored OpenBao now instead of
+# after eso_refresh_interval.
+openbao_snapshot_restore_force_sync: true
+# Seconds to let the followers apply a restored snapshot before the seal check.
+openbao_snapshot_settle_seconds: 10
+# Labels on the snapshot Job and its pod (_openbao_snapshot_mode: save | restore).
+_openbao_snapshot_labels:
+  app.kubernetes.io/name: openbao-snapshot
+  app.kubernetes.io/part-of: openbao
+  app.kubernetes.io/component: "{{ _openbao_snapshot_mode | default('save') }}"
+
+# --- CA bundle (both modes, tasks/ca_bundle.yaml) ---------------------------------
+# ConfigMap in openbao_namespace with key ca.crt (certificate only, never a
+# key): the CA that signed the OpenBao listener. Internal mode copies it from
+# Secret openbao_tls_ca_secret_name, external mode from openbao_ca_file. The
+# gateway (BackendTLSPolicy) and the in-cluster clients trust it.
+openbao_ca_bundle_configmap: "openbao-ca-bundle"
+
+# --- Route (internal mode, openbao_route_enabled; tasks/route.yaml) -----------
+# HTTPRoute on the gateway's https listener to the active OpenBao pod, TLS
+# re-encrypted to the backend (BackendTLSPolicy) and a path allowlist.
+openbao_route_hostname: "openbao.{{ base_domain_name }}"
+openbao_route_name: "openbao"
+openbao_route_backend_tls_policy_name: "openbao-backend-tls"
+openbao_route_security_policy_name: "openbao-no-auth"
+openbao_route_gateway_name: "{{ gateway_name | default('eg-gateway') }}"
+openbao_route_gateway_namespace: "{{ gateway_namespace | default('envoy-gateway-system') }}"
+# The Service the route targets (chart: <fullname>-active, the unsealed leader)
+# and the name the backend TLS certificate is checked against (a server cert SAN).
+openbao_route_backend_service: "{{ openbao_fullname }}-active"
+openbao_route_backend_hostname: "{{ openbao_fullname }}-active.{{ openbao_namespace }}.svc"
+# Wait for the gateway to accept the route (status.parents Accepted/ResolvedRefs).
+openbao_route_wait_retries: 24
+openbao_route_wait_delay: 5
+
+# --- External mode checks (tasks/external_checks.yaml) -------------------------
+# Read-only checks of the operator's OpenBao, run from the installer host.
+# Seconds per HTTP request to openbao_address.
+openbao_external_timeout: 10
+# false: ignore http(s)_proxy for openbao_address (otherwise add its host to no_proxy).
+openbao_external_use_proxy: true
+# Lifetime of the ServiceAccount token minted for the operator-role login.
+openbao_external_token_duration: "10m"
+# Tasks that set _openbao_ext_token (operator-role login). Tests point this at
+# their own include; there is no token input variable.
+_openbao_external_login_tasks: "external_login.yaml"
+
+# --- Teardown -----------------------------------------------------------------
+# Removing the component never destroys stored secrets unless this is set. Kept
+# PVCs retain all secrets (Raft data); the namespace is kept with them.
+openbao_teardown_delete_data: false

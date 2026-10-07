@@ -1,0 +1,91 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# The Raft snapshot Job (tasks/snapshot_job.yaml; _openbao_snapshot_mode: save | restore).
+# Runs files/snapshot.sh in openbao_backup_namespace: logs in to OpenBao as
+# Kubernetes-auth role 'backup' with a projected, audience-bound ServiceAccount
+# token and saves the snapshot to (or restores it from) the snapshot PVC.
+# No API token is mounted (automountServiceAccountToken: false); PSS restricted.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ (openbao_snapshot_job_name ~ '-' ~ _openbao_snapshot_mode) | to_json }}
+  namespace: {{ openbao_backup_namespace | to_json }}
+  labels: {{ _openbao_snapshot_labels | to_json }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ openbao_snapshot_job_timeout | int }}
+  template:
+    metadata:
+      labels: {{ _openbao_snapshot_labels | to_json }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ openbao_backup_sa | to_json }}
+      automountServiceAccountToken: false
+      affinity: {{ _platform_affinity | default({}) | to_json }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: snapshot
+          image: {{ openbao_image | to_json }}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/snapshot.sh", {{ _openbao_snapshot_mode | to_json }}]
+          env:
+            - name: BAO_ADDR
+              value: {{ ('https://' ~ openbao_fullname ~ '-active.' ~ openbao_namespace ~ '.svc:8200') | to_json }}
+            - name: BAO_CACERT
+              value: "/ca/ca.crt"
+            - name: OB_AUTH_MOUNT
+              value: "kubernetes"
+            - name: OB_ROLE
+              value: "backup"
+            - name: OB_JWT_FILE
+              value: "/var/run/secrets/openbao/token"
+            - name: OB_SNAPSHOT_DIR
+              value: "/snapshots"
+            - name: HOME
+              value: "/tmp"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests: {cpu: "50m", memory: "64Mi"}
+            limits: {memory: "512Mi"}
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts, readOnly: true}
+            - {name: ca, mountPath: /ca, readOnly: true}
+            - {name: token, mountPath: /var/run/secrets/openbao, readOnly: true}
+            - {name: snapshots, mountPath: /snapshots}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ openbao_snapshot_script_configmap | to_json }}
+        - name: ca
+          configMap:
+            name: {{ openbao_ca_bundle_configmap | to_json }}
+            items:
+              - {key: ca.crt, path: ca.crt}
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ openbao_auth_audience | to_json }}
+                  expirationSeconds: {{ openbao_snapshot_token_seconds | int }}
+                  path: token
+        - name: snapshots
+          persistentVolumeClaim:
+            claimName: {{ openbao_snapshot_pvc | to_json }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi

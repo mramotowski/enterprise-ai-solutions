@@ -1,0 +1,32 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — the rollout order (rollout.yaml; separate so the render test can
+# drive it with fabricated StatefulSet and pod lists).
+# Input: _openbao_sts, _openbao_roll_pods (k8s_info results),
+# _openbao_current_replicas, openbao_replicas.
+# Sets _openbao_roll_plan: [{name, delete}], new pods first (no delete), then
+# the stale standbys, the active pod last.
+
+- name: "openbao | rollout | Plan"
+  vars:
+    _rev: "{{ _openbao_sts.resources[0].status.updateRevision }}"
+    _pods: "{{ _openbao_roll_pods.resources | default([]) }}"
+    _new_names: >-
+      {% set r = [] %}{% for p in _pods %}{% set o = p.metadata.name | regex_replace('^.*-([0-9]+)$', '\\1') | int %}{%
+      if o >= (_openbao_current_replicas | int) and o < (openbao_replicas | int) %}{% set _ = r.append(p.metadata.name) %}{% endif %}{%
+      endfor %}{{ r | sort }}
+    _stale: >-
+      {% set r = [] %}{% for p in _pods %}{% set o = p.metadata.name | regex_replace('^.*-([0-9]+)$', '\\1') | int %}{%
+      if o < (_openbao_current_replicas | int) and o < (openbao_replicas | int)
+      and (p.metadata.labels | default({})).get('controller-revision-hash', '') != _rev %}{%
+      set _ = r.append({'name': p.metadata.name,
+                        'active': (p.metadata.labels | default({})).get('openbao-active', '') == 'true'}) %}{% endif %}{%
+      endfor %}{{ r }}
+  ansible.builtin.set_fact:
+    _openbao_roll_plan: >-
+      {% set r = [] %}{% for n in _new_names %}{% set _ = r.append({'name': n, 'delete': false}) %}{% endfor %}{%
+      for p in (_stale | rejectattr('active') | sort(attribute='name', reverse=true) | list)
+               + (_stale | selectattr('active') | list) %}{% set _ = r.append({'name': p.name, 'delete': true}) %}{%
+      endfor %}{{ r }}

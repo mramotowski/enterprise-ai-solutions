@@ -1,0 +1,312 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# external_secrets — offline admission-policy test (no cluster access).
+#
+# Renders templates/externalsecret-path-policy.yaml.j2 for two layers and
+# evaluates it with the Kubernetes API server's own ValidatingAdmissionPolicy
+# code (k8s.io/apiserver v0.34.3 = Kubernetes 1.34, tests/files/vapcheck): the
+# same CEL environment, compiler, matchConditions and validator, against
+# ExternalSecret admission requests. Needs Go (a newer toolchain is fetched by
+# GOTOOLCHAIN=auto) and network access to the Go module proxy. Go module and
+# build caches go to the temp dir unless -e vap_test_go_cache=<dir> points at
+# a persistent one (e.g. "$(go env GOPATH)/vapcheck-cache"), which makes
+# re-runs fast.
+#
+# Run from the repo root:
+#   ansible-playbook -i localhost, -c local roles/external_secrets/tests/vap_test.yaml
+
+- name: "external_secrets | admission policy test"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role_dir: "{{ playbook_dir | dirname }}"
+    _go_cache: "{{ vap_test_go_cache | default(_tmp.path ~ '/go', true) }}"
+    _go_env:
+      GOMODCACHE: "{{ _go_cache }}/mod"
+      GOCACHE: "{{ _go_cache }}/build"
+      GOPATH: "{{ _go_cache }}/path"
+      GOTOOLCHAIN: "auto"
+      GOFLAGS: "-mod=mod"
+      GOTELEMETRY: "off"
+      GOENV: "off"
+    _k8s_libs: "v0.34.3"
+    secrets_backend: openbao
+    openbao_mode: internal
+    env_name: test
+    openbao_cluster_id: c1
+    openbao_kv_mount: intel-ai
+    openbao_layers: [erag, inference]
+    openbao_auth_audience: vault
+    # Namespaces used by the cases.
+    _ns_erag:
+      name: erag-ns
+      labels: {"secrets.ai-solutions/erag": "true"}
+      annotations: {"secrets.ai-solutions/erag-paths": "erag/keycloak/erag-admin, erag/edp/postgresql,inference/x"}
+    _ns_both:
+      name: both-ns
+      labels: {"secrets.ai-solutions/erag": "true", "secrets.ai-solutions/inference": "true"}
+      annotations:
+        "secrets.ai-solutions/erag-paths": "erag/keycloak/erag-admin"
+        "secrets.ai-solutions/inference-paths": "inference/litellm/master-key"
+    _ns_label_only:
+      name: label-only
+      labels: {"secrets.ai-solutions/erag": "true"}
+    _ns_plain:
+      name: plain
+      annotations: {"secrets.ai-solutions/erag-paths": "erag/keycloak/erag-admin"}
+    _css_erag: {kind: ClusterSecretStore, name: openbao-erag}
+    _cases:
+      - name: "allowed: data key listed"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/keycloak/erag-admin, property: password}}]}
+        expect: allow
+      - name: "allowed: dataFrom.extract key listed (annotation whitespace)"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", dataFrom: [{extract: {key: c1/erag/edp/postgresql}}]}
+        expect: allow
+      - name: "denied: key not listed"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/edp/other}}]}
+        expect: deny
+        message: "reads OpenBao paths not allowed in namespace 'erag-ns': c1/erag/edp/other \\(store openbao-erag\\)"
+      - name: "denied: other layer's path listed under this layer"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/inference/x}}]}
+        expect: deny
+        message: "c1/inference/x"
+      - name: "denied: other cluster id"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c2/erag/keycloak/erag-admin}}]}
+        expect: deny
+      - name: "denied: mount-prefixed key (not canonical)"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: intel-ai/c1/erag/keycloak/erag-admin}}]}
+        expect: deny
+      - name: "denied: KV v2 data/ key form"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: intel-ai/data/c1/erag/keycloak/erag-admin}}]}
+        expect: deny
+      - name: "denied: comma-joined key"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: "c1/erag/keycloak/erag-admin,erag/edp/postgresql"}}]}
+        expect: deny
+      - name: "denied: traversal"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/keycloak/../edp/postgresql}}]}
+        expect: deny
+      - name: "denied: one good and one bad entry (names only the bad one)"
+        ns: _ns_erag
+        spec:
+          secretStoreRef: "{{ _css_erag }}"
+          data:
+            - {secretKey: a, remoteRef: {key: c1/erag/keycloak/erag-admin}}
+            - {secretKey: b, remoteRef: {key: c1/erag/nats/seed}}
+        expect: deny
+        message: "'erag-ns': c1/erag/nats/seed \\(store openbao-erag\\)\\. Allowed"
+      - name: "denied: labelled namespace without the paths annotation"
+        ns: _ns_label_only
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/keycloak/erag-admin}}]}
+        expect: deny
+        message: "not allowed in namespace 'label-only'"
+      - name: "denied: namespace not labelled for the layer"
+        ns: _ns_plain
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/keycloak/erag-admin}}]}
+        expect: deny
+        message: "missing label secrets.ai-solutions/erag=true"
+      - name: "denied: dataFrom.find"
+        ns: _ns_erag
+        spec: {secretStoreRef: "{{ _css_erag }}", dataFrom: [{find: {path: c1/erag, name: {regexp: ".*"}}}]}
+        expect: deny
+        message: "dataFrom.find is not allowed"
+      - name: "denied: data[].sourceRef.storeRef overrides an unrelated default store"
+        ns: _ns_erag
+        spec:
+          secretStoreRef: {kind: ClusterSecretStore, name: aws}
+          data: [{secretKey: p, remoteRef: {key: c1/erag/nats/seed}, sourceRef: {storeRef: "{{ _css_erag }}"}}]
+        expect: deny
+      - name: "allowed: data[].sourceRef.storeRef with a listed key"
+        ns: _ns_erag
+        spec:
+          secretStoreRef: {kind: ClusterSecretStore, name: aws}
+          data: [{secretKey: p, remoteRef: {key: c1/erag/keycloak/erag-admin}, sourceRef: {storeRef: "{{ _css_erag }}"}}]
+        expect: allow
+      - name: "denied: dataFrom[].sourceRef.storeRef with an unlisted key"
+        ns: _ns_erag
+        spec:
+          secretStoreRef: {kind: ClusterSecretStore, name: aws}
+          dataFrom: [{extract: {key: c1/erag/nats/seed}, sourceRef: {storeRef: "{{ _css_erag }}"}}]
+        expect: deny
+      - name: "allowed: sourceRef.storeRef to another store, default store is OpenBao"
+        ns: _ns_plain
+        spec:
+          secretStoreRef: "{{ _css_erag }}"
+          data: [{secretKey: p, remoteRef: {key: anything}, sourceRef: {storeRef: {kind: ClusterSecretStore, name: aws}}}]
+        expect: allow
+      - name: "allowed: dataFrom generator next to an OpenBao default store"
+        ns: _ns_erag
+        spec:
+          secretStoreRef: "{{ _css_erag }}"
+          data: [{secretKey: p, remoteRef: {key: c1/erag/keycloak/erag-admin}}]
+          dataFrom: [{sourceRef: {generatorRef: {apiVersion: generators.external-secrets.io/v1alpha1, kind: Password, name: pw}}}]
+        expect: allow
+      - name: "allowed: namespaced SecretStore named openbao-erag"
+        ns: _ns_plain
+        spec: {secretStoreRef: {kind: SecretStore, name: openbao-erag}, data: [{secretKey: p, remoteRef: {key: c1/erag/nats/seed}}]}
+        expect: allow
+      - name: "allowed: kind omitted (SecretStore) named openbao-erag"
+        ns: _ns_plain
+        spec: {secretStoreRef: {name: openbao-erag}, data: [{secretKey: p, remoteRef: {key: c1/erag/nats/seed}}]}
+        expect: allow
+      - name: "allowed: another ClusterSecretStore"
+        ns: _ns_plain
+        spec: {secretStoreRef: {kind: ClusterSecretStore, name: vault-other}, data: [{secretKey: p, remoteRef: {key: c1/erag/nats/seed}}]}
+        expect: allow
+      - name: "allowed: no store refs at all"
+        ns: _ns_plain
+        spec: {target: {name: x}}
+        expect: allow
+      - name: "allowed: second layer in a namespace enabled for both"
+        ns: _ns_both
+        spec: {secretStoreRef: {kind: ClusterSecretStore, name: openbao-inference}, data: [{secretKey: k, remoteRef: {key: c1/inference/litellm/master-key}}]}
+        expect: allow
+      - name: "denied: second layer's store with the first layer's path"
+        ns: _ns_both
+        spec: {secretStoreRef: {kind: ClusterSecretStore, name: openbao-inference}, data: [{secretKey: k, remoteRef: {key: c1/erag/keycloak/erag-admin}}]}
+        expect: deny
+      - name: "denied: second layer's store in a namespace enabled only for the first"
+        ns: _ns_erag
+        spec: {secretStoreRef: {kind: ClusterSecretStore, name: openbao-inference}, data: [{secretKey: k, remoteRef: {key: c1/inference/x}}]}
+        expect: deny
+        message: "missing label secrets.ai-solutions/inference=true"
+      - name: "allowed: UPDATE that leaves spec unchanged (finalizer patch)"
+        ns: _ns_plain
+        operation: UPDATE
+        old_spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/nats/seed}}]}
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/nats/seed}}]}
+        finalizers: [externalsecrets.external-secrets.io/externalsecret-cleanup]
+        expect: allow
+      - name: "denied: UPDATE that changes spec to an unlisted key"
+        ns: _ns_erag
+        operation: UPDATE
+        old_spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/keycloak/erag-admin}}]}
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/nats/seed}}]}
+        expect: deny
+      - name: "allowed: finalizer removal on an object being deleted (spec unchanged)"
+        ns: _ns_plain
+        operation: UPDATE
+        deleting: true
+        old_spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/nats/seed}}]}
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/nats/seed}}]}
+        expect: allow
+      - name: "denied: spec change on an object being deleted"
+        ns: _ns_erag
+        operation: UPDATE
+        deleting: true
+        old_spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/keycloak/erag-admin}}]}
+        spec: {secretStoreRef: "{{ _css_erag }}", data: [{secretKey: p, remoteRef: {key: c1/erag/nats/other}}]}
+        expect: deny
+  tasks:
+    - name: "external_secrets | test | Temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: eso-vap
+      register: _tmp
+
+    - name: "external_secrets | test | Run"
+      block:
+        - name: "external_secrets | test | Preflight (resolves the stores and the cluster id)"
+          ansible.builtin.include_role:
+            name: "{{ _role_dir }}"
+            tasks_from: preflight.yaml
+
+        # Role defaults are not visible to the play's own template task.
+        - name: "external_secrets | test | Load role defaults"
+          ansible.builtin.include_vars:
+            file: "{{ _role_dir }}/defaults/main.yaml"
+
+        - name: "external_secrets | test | Render the policy"
+          ansible.builtin.template:
+            src: "{{ _role_dir }}/templates/externalsecret-path-policy.yaml.j2"
+            dest: "{{ _tmp.path }}/policy.yaml"
+            mode: "0600"
+
+        - name: "external_secrets | test | Static checks of the rendered policy"
+          vars:
+            _docs: "{{ lookup('ansible.builtin.file', _tmp.path ~ '/policy.yaml') | from_yaml_all | list }}"
+            _vars: "{{ _docs[0].spec.variables | items2dict(key_name='name', value_name='expression') }}"
+            _want_stores: '{"openbao-erag": "erag", "openbao-inference": "inference"}'
+          ansible.builtin.assert:
+            that:
+              - _docs | map(attribute='kind') | list == ['ValidatingAdmissionPolicy', 'ValidatingAdmissionPolicyBinding']
+              - _docs[0].spec.failurePolicy == 'Fail'
+              - _docs[1].spec.validationActions == ['Deny']
+              - _docs[1].spec.policyName == _docs[0].metadata.name
+              - (_vars.stores | trim) == _want_stores
+              - (_vars.cid | trim) == '"c1"'
+            quiet: true
+
+        - name: "external_secrets | test | Write the admission cases"
+          vars:
+            _rendered: >-
+              {% set r = [] %}{% for c in _cases %}{% set obj = {'apiVersion': 'external-secrets.io/v1', 'kind': 'ExternalSecret',
+              'metadata': {'name': 'es-' ~ loop.index, 'namespace': lookup('ansible.builtin.vars', c.ns).name}, 'spec': c.spec} %}{% if c.finalizers is defined %}{% set _ = obj.metadata.update({'finalizers': c.finalizers}) %}{% endif %}{% if c.deleting | default(false) %}{% set _ = obj.metadata.update({'deletionTimestamp': '2026-10-02T00:00:00Z', 'finalizers': ['externalsecrets.external-secrets.io/externalsecret-cleanup']}) %}{% endif %}{% set e = {'name': c.name,
+              'operation': c.operation | default('CREATE'), 'namespace': lookup('ansible.builtin.vars', c.ns), 'object': obj,
+              'expect': c.expect, 'message': c.message | default('')} %}{% if c.old_spec is defined %}{% set _ = e.update({'oldObject': {'apiVersion': 'external-secrets.io/v1',
+              'kind': 'ExternalSecret', 'metadata': {'name': obj.metadata.name, 'namespace': obj.metadata.namespace}, 'spec': c.old_spec}}) %}{% endif %}{% set _ = r.append(e) %}{% endfor %}{{ r }}
+          ansible.builtin.copy:
+            content: "{{ _rendered | to_nice_yaml }}"
+            dest: "{{ _tmp.path }}/cases.yaml"
+            mode: "0600"
+
+        - name: "external_secrets | test | Copy vapcheck"
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/files/vapcheck"
+            dest: "{{ _tmp.path }}/"
+            mode: "0600"
+            directory_mode: "0700"
+
+        - name: "external_secrets | test | Prepare the vapcheck module (k8s.io libraries {{ _k8s_libs }})"
+          ansible.builtin.shell: |
+            set -e
+            go mod init vapcheck >/dev/null 2>&1
+            go get k8s.io/apiserver@{{ _k8s_libs }} k8s.io/api@{{ _k8s_libs }} k8s.io/apimachinery@{{ _k8s_libs }} sigs.k8s.io/yaml@v1.6.0
+            go mod tidy
+          args:
+            chdir: "{{ _tmp.path }}/vapcheck"
+          environment: "{{ _go_env }}"
+          changed_when: false
+
+        - name: "external_secrets | test | Evaluate the policy"
+          ansible.builtin.command:
+            cmd: go run . {{ _tmp.path }}/policy.yaml {{ _tmp.path }}/cases.yaml
+            chdir: "{{ _tmp.path }}/vapcheck"
+          environment: "{{ _go_env }}"
+          register: _vapcheck
+          changed_when: false
+          failed_when: false
+
+        - name: "external_secrets | test | Result"
+          ansible.builtin.debug:
+            msg: "{{ _vapcheck.stdout_lines + (_vapcheck.stderr_lines | select('search', '(?i)error|panic|fail') | list) }}"
+
+        - name: "external_secrets | test | Assert every case passed"
+          ansible.builtin.assert:
+            that:
+              - _vapcheck.rc == 0
+              - _vapcheck.stdout is search('^' ~ (_cases | length) ~ '/' ~ (_cases | length) ~ ' cases passed$', multiline=true)
+            fail_msg: "vapcheck failed (rc {{ _vapcheck.rc }}): {{ _vapcheck.stderr | default('') | truncate(2000) }}"
+            success_msg: "{{ _cases | length }} admission cases passed"
+      always:
+        - name: "external_secrets | test | Make the Go cache removable"
+          ansible.builtin.command:
+            cmd: chmod -R u+w {{ _tmp.path }}
+          changed_when: false
+          failed_when: false
+
+        - name: "external_secrets | test | Remove temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

@@ -1,0 +1,28 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — pre_backup hook: Raft snapshot of the internal OpenBao (AD-14).
+#
+# For backup profiles that cover data whose credentials live in OpenBao (erag):
+#
+#   namespace_order: [openbao-backup, ...]     # openbao_backup_namespace
+#   pre_backup:
+#     - {kind: role, name: "OpenBao raft snapshot", role: openbao, tasks_from: snapshot_backup.yaml}
+#   post_restore:
+#     - {kind: role, name: "OpenBao raft snapshot restore", role: openbao, tasks_from: snapshot_restore.yaml}
+#
+# A Job in openbao_backup_namespace logs in as role 'backup' and writes the
+# snapshot (+ sha256) to PVC openbao_snapshot_pvc; the backup then captures that
+# namespace like any other. The snapshot never passes through the installer
+# host or a 'capture' hook. A no-op unless secrets_backend: openbao and
+# openbao_mode: internal. Docs: docs/deploy/openbao.md, "Backup and restore".
+
+- name: "openbao | snapshot | backup | Applicable?"
+  ansible.builtin.include_tasks: snapshot_gate.yaml
+
+- name: "openbao | snapshot | backup | Save"
+  ansible.builtin.include_tasks: snapshot_job.yaml
+  vars:
+    _openbao_snapshot_mode: save
+  when: _openbao_snapshot_active | bool

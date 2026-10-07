@@ -1,0 +1,29 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# external_secrets — fail unless every store in _eso_store_status (the looped
+# k8s_info results of store_wait.yaml) is Ready with reason Valid, naming each
+# bad store with its condition reason and message.
+
+- name: "external_secrets | Assert every ClusterSecretStore is Valid"
+  vars:
+    _bad: >-
+      {% set r = [] %}{% for res in _eso_store_status.results %}{% set c = (((res.resources | default([{}]) | first).status
+      | default({})).conditions | default([]) | selectattr('type', 'eq', 'Ready') | list) %}{% if not (c
+      | selectattr('status', 'eq', 'True') | selectattr('reason', 'eq', 'Valid') | list) %}{% set _ = r.append(res.item.name
+      ~ ': ' ~ (('lookup failed: ' ~ res.msg | default('?')) if res.failed | default(false) and not res.resources | default([])
+      else ((c | first).reason | default('no status') if c else ('not found' if not res.resources | default([]) else 'no Ready condition yet')))
+      ~ ((' - ' ~ (c | first).message) if c and (c | first).message is defined else '')) %}{% endif %}{% endfor %}{{ r }}
+  ansible.builtin.assert:
+    that:
+      - _bad | length == 0
+    fail_msg: >-
+      ClusterSecretStore not Valid: {{ _bad | join('; ') }}. ESO logs in to {{ _eso_server }} at
+      auth/{{ _eso_auth_mount }} as role eso-<layer> with a token of ServiceAccount
+      {{ external_secrets_namespace }}/{{ external_secrets_service_account_name }} (audience
+      {{ _eso_audience }}), trusting ConfigMap {{ _eso_openbao_namespace }}/{{ _eso_ca_configmap }}.
+      Check: OpenBao unsealed (openbao validate), the eso-<layer> roles
+      {{ '(the operator template, docs/deploy/openbao.md "External OpenBao")' if _eso_external | bool else '(bootstrap)' }},
+      the OpenBao NetworkPolicy, and kubectl -n {{ external_secrets_namespace }} logs deploy/{{ external_secrets_helm_release_name }}.
+    success_msg: "ClusterSecretStores Valid: {{ _eso_stores | map(attribute='name') | join(', ') }}"

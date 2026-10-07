@@ -1,0 +1,176 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# external_secrets — Install
+#
+# External Secrets Operator (chart external-secrets, pinned in defaults), then
+# per layer in openbao_layers one ClusterSecretStore openbao-<layer> (stable
+# vault provider against OpenBao, Kubernetes auth as role eso-<layer>), and the
+# ValidatingAdmissionPolicy that pins each namespace's ExternalSecrets to the
+# paths it may read. Runs after openbao (components.yaml), which provides the
+# CA bundle ConfigMap and the eso-<layer> roles. Also the upgrade action:
+# ESO changes only by bumping external_secrets_chart_version.
+
+- name: "external_secrets | Preflight"
+  ansible.builtin.include_tasks: preflight.yaml
+
+- name: "external_secrets | Read the OpenBao CA bundle"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: "{{ _eso_ca_configmap }}"
+    namespace: "{{ _eso_openbao_namespace }}"
+  register: _eso_ca_bundle
+
+- name: "external_secrets | Preflight — OpenBao CA bundle exists"
+  ansible.builtin.assert:
+    that:
+      - _eso_ca_bundle.resources | default([]) | length == 1
+      - "'-----BEGIN CERTIFICATE-----' in (_eso_ca_bundle.resources[0].data | default({})).get('ca.crt', '')"
+    fail_msg: >-
+      ConfigMap {{ _eso_openbao_namespace }}/{{ _eso_ca_configmap }} (key ca.crt, the CA of OpenBao) is
+      missing or empty. The openbao component creates it; run
+      ./es_auto_installer.sh install platform --env {{ env_name | default('<env>') }} (it installs
+      openbao before external_secrets).
+    quiet: true
+
+# ESO must be this installer's: a second controller and webhook would
+# reconcile the same objects, and Helm cannot adopt CRDs of another release.
+- name: "external_secrets | Read an existing ExternalSecret CRD"
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: externalsecrets.external-secrets.io
+  register: _eso_existing_crd
+
+- name: "external_secrets | Preflight — no External Secrets Operator from elsewhere"
+  vars:
+    _ann: "{{ (_eso_existing_crd.resources | default([{}]) | first).metadata.annotations | default({}) }}"
+  ansible.builtin.assert:
+    that:
+      - _eso_existing_crd.resources | default([]) | length == 0
+        or (_ann['meta.helm.sh/release-name'] | default('') == external_secrets_helm_release_name
+            and _ann['meta.helm.sh/release-namespace'] | default('') == external_secrets_namespace)
+    fail_msg: >-
+      The cluster already has External Secrets Operator CRDs that this installer did not install
+      (CRD externalsecrets.external-secrets.io belongs to Helm release
+      '{{ _ann['meta.helm.sh/release-namespace'] | default('?') }}/{{ _ann['meta.helm.sh/release-name'] | default('none') }}',
+      expected '{{ external_secrets_namespace }}/{{ external_secrets_helm_release_name }}'). The platform
+      installs and owns ESO; remove the other installation, or set external_secrets_namespace and
+      external_secrets_helm_release_name to match it if it is a previous install by this installer.
+    quiet: true
+
+# ── Namespace ─────────────────────────────────────────────────────────────────
+
+- name: "external_secrets | Ensure namespace"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ external_secrets_namespace }}"
+
+# restricted: the chart runs every container non-root, read-only root
+# filesystem, no privilege escalation, all capabilities dropped, RuntimeDefault
+# seccomp (tests/render_test.yaml checks the rendered pods).
+- name: "external_secrets | Label namespace — PSS"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ external_secrets_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "restricted"
+          pod-security.kubernetes.io/audit: "restricted"
+          pod-security.kubernetes.io/warn: "restricted"
+  when: enforce_pss | default(false) | bool
+
+# ── Helm ──────────────────────────────────────────────────────────────────────
+
+- name: "external_secrets | Add External Secrets Helm repo"
+  kubernetes.core.helm_repository:
+    name: external-secrets
+    repo_url: "{{ external_secrets_chart_repo_url }}"
+  register: _eso_repo
+  until: _eso_repo is succeeded
+  retries: "{{ helm_retries }}"
+  delay: 15
+
+- name: "external_secrets | Deploy External Secrets Operator"
+  kubernetes.core.helm:
+    name: "{{ external_secrets_helm_release_name }}"
+    chart_ref: external-secrets/external-secrets
+    release_namespace: "{{ external_secrets_namespace }}"
+    create_namespace: false
+    chart_version: "{{ external_secrets_chart_version }}"
+    wait: "{{ helm_wait }}"
+    timeout: "{{ helm_timeout }}"
+    values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+  register: _eso_helm
+  until: _eso_helm is succeeded
+  retries: "{{ helm_retries }}"
+  delay: 15
+
+# The chart's controller ClusterRole has no serviceaccounts/token create
+# (rbac.serviceAccountTokenCreate: false); the stores need a token for the
+# controller's own ServiceAccount only.
+- name: "external_secrets | Allow the controller to mint tokens for its own ServiceAccount"
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'token-rbac.yaml.j2') | from_yaml_all | list }}"
+
+# ── Admission policy ──────────────────────────────────────────────────────────
+# Before the stores: a store must never be usable without the path pinning
+# (also for a layer just added to openbao_layers).
+
+- name: "external_secrets | Pin ExternalSecrets to their namespace's OpenBao paths"
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'externalsecret-path-policy.yaml.j2') | from_yaml_all | list }}"
+
+# ── ClusterSecretStores ───────────────────────────────────────────────────────
+
+# The ESO webhook validates stores; right after the chart install its serving
+# certificate may still be in flight, so retry.
+- name: "external_secrets | Apply ClusterSecretStores ({{ _eso_stores | map(attribute='name') | join(', ') }})"
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'cluster-secret-store.yaml.j2') | from_yaml_all | list }}"
+  register: _eso_store_apply
+  until: _eso_store_apply is succeeded
+  retries: 12
+  delay: 5
+
+# A layer dropped from openbao_layers loses its store.
+- name: "external_secrets | Find installer-managed ClusterSecretStores"
+  kubernetes.core.k8s_info:
+    api_version: external-secrets.io/v1
+    kind: ClusterSecretStore
+    label_selectors: "{{ _eso_store_selector }}"
+  register: _eso_managed_stores
+
+- name: "external_secrets | Remove ClusterSecretStores of layers no longer in openbao_layers"
+  kubernetes.core.k8s:
+    api_version: external-secrets.io/v1
+    kind: ClusterSecretStore
+    name: "{{ item }}"
+    state: absent
+  loop: "{{ _eso_stale_stores }}"
+
+- name: "external_secrets | Wait until each ClusterSecretStore is Valid"
+  ansible.builtin.include_tasks: store_wait.yaml
+
+- name: "external_secrets | Install complete"
+  ansible.builtin.debug:
+    msg: >-
+      External Secrets Operator {{ external_secrets_chart_version }} in namespace '{{ external_secrets_namespace }}';
+      ClusterSecretStores {{ _eso_stores | map(attribute='name') | join(', ') }} are Valid against
+      {{ _eso_server }} (auth/{{ _eso_auth_mount }}, KV '{{ _eso_kv_mount }}', cluster id '{{ _eso_cluster_id }}').
+      A namespace uses the store of layer L when labelled {{ external_secrets_namespace_label_prefix }}L=true;
+      admission policy {{ external_secrets_path_policy_name }} limits its ExternalSecrets to the paths in
+      annotation {{ external_secrets_namespace_label_prefix }}L{{ external_secrets_paths_annotation_suffix }}.
+      Runbook: docs/deploy/openbao.md.

@@ -1,0 +1,44 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — refuse a replica-count decrease the Raft cluster is not prepared for
+# (internal mode, existing StatefulSet; no change is made here).
+#
+# Every server pod is a Raft voter. Scaling the StatefulSet down only stops the
+# highest pods; their peers stay in the Raft configuration, still count toward
+# the quorum, and a 3 -> 1 change leaves one voter of three: no leader, no
+# writes, no unseal of a restarted pod. The peers must be removed first
+# (bao operator raft remove-peer, docs/deploy/openbao.md "Scale down"), which
+# needs a temporary root token. The operator confirms that with
+# -e openbao_raft_peers_removed=true.
+#
+# Input: _openbao_sts_before (k8s_info of the StatefulSet, install_internal.yaml).
+# Sets _openbao_current_replicas (0 when there is no StatefulSet yet) and
+# _openbao_removed_ordinals (pods a confirmed scale-down removes).
+
+- name: "openbao | Replicas — current StatefulSet size"
+  ansible.builtin.set_fact:
+    _openbao_current_replicas: >-
+      {{ (_openbao_sts_before.resources[0].spec.replicas | default(0) | int)
+         if _openbao_sts_before.resources | default([]) | length > 0 else 0 }}
+    _openbao_removed_ordinals: >-
+      {{ range(openbao_replicas | int,
+               ((_openbao_sts_before.resources[0].spec.replicas | default(0) | int)
+                if _openbao_sts_before.resources | default([]) | length > 0 else 0)) | list }}
+
+- name: "openbao | Preflight — openbao_replicas is not lowered without removing Raft peers"
+  vars:
+    _gone: "{{ _openbao_removed_ordinals | map('regex_replace', '^', openbao_fullname ~ '-') | list }}"
+  ansible.builtin.assert:
+    that:
+      - (_openbao_removed_ordinals | length == 0) or (openbao_raft_peers_removed | bool)
+    fail_msg: >-
+      openbao_replicas would go from {{ _openbao_current_replicas }} to {{ openbao_replicas }}, which
+      stops {{ _gone | join(', ') }}. They are Raft voters: remove them from the Raft
+      configuration first, or the remaining {{ openbao_replicas }} pod(s) lose the quorum.
+      With a temporary root token (docs/deploy/openbao.md, "Change the bootstrap (generate-root)",
+      steps 1-3), in openbao-0: {% for p in _gone | reverse %}bao operator raft remove-peer {{ p }};
+      {% endfor %}bao operator raft list-peers; bao token revoke -self. Then re-run with
+      -e openbao_raft_peers_removed=true (docs/deploy/openbao.md, "Scale down"). Nothing was changed.
+    quiet: true

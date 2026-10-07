@@ -1,0 +1,31 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One rollout_plan.yaml case of render_test.yaml
+# (_case: {name, current, replicas, pods: [{n, rev, active?}], plan}). The
+# StatefulSet's updateRevision is r2.
+
+- name: "openbao | test | rollout {{ _case.name }} | Plan"
+  ansible.builtin.include_role:
+    name: "{{ _role_dir }}"
+    tasks_from: rollout_plan.yaml
+    public: true
+  vars:
+    openbao_replicas: "{{ _case.replicas }}"
+    _openbao_current_replicas: "{{ _case.current }}"
+    _openbao_sts:
+      resources: [{status: {updateRevision: r2}}]
+    _openbao_roll_pods:
+      resources: >-
+        {% set r = [] %}{% for p in _case.pods %}{% set l = {'controller-revision-hash': p.rev} %}{%
+        if p.active | default(false) %}{% set _ = l.update({'openbao-active': 'true'}) %}{% else %}{%
+        set _ = l.update({'openbao-active': 'false'}) %}{% endif %}{%
+        set _ = r.append({'metadata': {'name': 'openbao-' ~ p.n, 'labels': l}}) %}{% endfor %}{{ r }}
+
+- name: "openbao | test | rollout {{ _case.name }} | Assert order"
+  ansible.builtin.assert:
+    that:
+      - _openbao_roll_plan == _case.plan
+    fail_msg: "rollout {{ _case.name }}: got {{ _openbao_roll_plan }}, want {{ _case.plan }}"
+    quiet: true

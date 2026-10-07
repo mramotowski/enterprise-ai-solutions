@@ -1,0 +1,13 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# external_secrets — Upgrade
+#
+# ESO is upgraded only by bumping external_secrets_chart_version in
+# defaults/main.yaml (AD-13): the install is idempotent and upgrades the release
+# to the pinned chart, then re-applies the stores and the admission policy.
+# Read the ESO release notes for CRD or API changes before bumping.
+
+- name: "external_secrets | upgrade | Upgrade to chart {{ external_secrets_chart_version }}"
+  ansible.builtin.include_tasks: install.yaml

@@ -1,0 +1,80 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# external_secrets — Validate
+#
+# Read-only: the Helm release is deployed, the controller, webhook and
+# cert-controller Deployments are available, every openbao-<layer>
+# ClusterSecretStore is Ready with reason Valid (ESO can log in to OpenBao),
+# and the ExternalSecret path admission policy and its binding exist.
+
+- name: "external_secrets | validate | Preflight"
+  ansible.builtin.include_tasks: preflight.yaml
+
+- name: "external_secrets | validate | Check Helm release"
+  kubernetes.core.helm_info:
+    name: "{{ external_secrets_helm_release_name }}"
+    release_namespace: "{{ external_secrets_namespace }}"
+  register: _eso_release
+
+- name: "external_secrets | validate | Assert Helm release is deployed"
+  ansible.builtin.assert:
+    that:
+      - _eso_release.status is defined
+      - (_eso_release.status.status | default('') | lower) == 'deployed'
+    fail_msg: >-
+      External Secrets Helm release '{{ external_secrets_helm_release_name }}' is not deployed in namespace
+      {{ external_secrets_namespace }} (status: {{ _eso_release.status.status | default('not installed') }}).
+    success_msg: "External Secrets Helm release deployed ({{ _eso_release.status.app_version | default('') }})"
+
+- name: "external_secrets | validate | Check Deployments"
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ external_secrets_namespace }}"
+    name: "{{ item }}"
+  register: _eso_deployments
+  loop:
+    - "{{ external_secrets_helm_release_name }}"
+    - "{{ external_secrets_helm_release_name }}-webhook"
+    - "{{ external_secrets_helm_release_name }}-cert-controller"
+
+- name: "external_secrets | validate | Assert Deployments are available"
+  vars:
+    _unavailable: >-
+      {% set r = [] %}{% for res in _eso_deployments.results %}{% set d = res.resources | default([]) %}{% if not d
+      or (d[0].status.availableReplicas | default(0) | int) < 1
+      or (d[0].status.availableReplicas | default(0) | int) < (d[0].spec.replicas | default(1) | int) %}{% set _ = r.append(res.item) %}{% endif %}{% endfor %}{{ r }}
+  ansible.builtin.assert:
+    that:
+      - _unavailable | length == 0
+    fail_msg: >-
+      External Secrets Deployments not available in namespace {{ external_secrets_namespace }}:
+      {{ _unavailable | join(', ') }}.
+    success_msg: "External Secrets controller, webhook and cert-controller available"
+
+- name: "external_secrets | validate | ClusterSecretStores"
+  ansible.builtin.include_tasks: store_wait.yaml
+  vars:
+    _eso_store_wait_retries: 0
+
+- name: "external_secrets | validate | Check the admission policy"
+  kubernetes.core.k8s_info:
+    api_version: admissionregistration.k8s.io/v1
+    kind: "{{ item }}"
+    name: "{{ external_secrets_path_policy_name }}"
+  register: _eso_policy
+  loop:
+    - ValidatingAdmissionPolicy
+    - ValidatingAdmissionPolicyBinding
+
+- name: "external_secrets | validate | Assert the admission policy and binding exist"
+  ansible.builtin.assert:
+    that:
+      - _eso_policy.results | map(attribute='resources') | map('length') | min > 0
+    fail_msg: >-
+      ValidatingAdmissionPolicy or ValidatingAdmissionPolicyBinding '{{ external_secrets_path_policy_name }}' is missing:
+      ExternalSecrets are not pinned to their namespace's OpenBao paths. Re-run
+      ./es_auto_installer.sh install platform --env {{ env_name | default('<env>') }}.
+    success_msg: "Admission policy {{ external_secrets_path_policy_name }} present"

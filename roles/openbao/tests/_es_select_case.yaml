@@ -1,0 +1,21 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# The snapshot_es_select.yaml case of render_test.yaml (_es_items, _es_expected).
+
+- name: "openbao | test | force-sync selection | Run"
+  ansible.builtin.include_role:
+    name: "{{ _role_dir }}"
+    tasks_from: snapshot_es_select.yaml
+    public: true
+  vars:
+    _openbao_snap_es: {resources: "{{ _es_items }}"}
+    _openbao_snap_eso_defaults: {external_secrets_store_prefix: "openbao-"}
+
+- name: "openbao | test | force-sync selection | Assert"
+  ansible.builtin.assert:
+    that:
+      - _openbao_snap_es_ours | map(attribute='name') | sort == _es_expected
+    fail_msg: "selected {{ _openbao_snap_es_ours }}, want {{ _es_expected }}"
+    quiet: true

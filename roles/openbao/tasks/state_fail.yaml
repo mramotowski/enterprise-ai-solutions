@@ -1,0 +1,68 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — fail with operator instructions for any bootstrap.sh state other
+# than 'ok'. Used by init.yaml and validate.yaml. Input: _openbao_bs.
+
+- name: "openbao | Fail with instructions for state '{{ _openbao_bs.state }}'"
+  vars:
+    _st: "{{ _openbao_bs }}"
+    _env: "{{ env_name | default('<env>') }}"
+    _pods: >-
+      {{ (_st.sealed_pods | default('') | string).split() | map('regex_replace', '^', openbao_fullname ~ '-') | list }}
+    _unseal: >-
+      {% for p in _pods %}kubectl -n {{ openbao_namespace }} exec -ti {{ p }} -c openbao -- bao operator unseal
+      (run it {{ openbao_key_threshold }} times, one share each){{ '; ' if not loop.last else '' }}{% endfor %}
+    _runbook: "docs/deploy/openbao.md"
+    _messages:
+      sealed: >-
+        OpenBao is initialized but sealed on {{ _pods | join(', ') }}. The installer holds no
+        unseal shares and changed nothing. Unseal each pod, pod 0 first: {{ _unseal }}.
+        Then re-run the install ({{ _runbook }}, "Unseal after a restart").
+      mixed: >-
+        OpenBao pods are in mixed states ({{ _st.error | default('') }}). The installer changed
+        nothing. {% if _pods | length > 0 %}Unseal the sealed pods: {{ _unseal }}. {% endif %}If pod 0
+        is uninitialized while others are initialized, its data was lost: see {{ _runbook }},
+        "Pods in mixed states".
+      peer_unreachable: >-
+        OpenBao pod(s) {{ (_st.unreachable_pods | default('') | string).split() | map('regex_replace', '^', openbao_fullname ~ '-') | join(', ') }}
+        did not answer from pod {{ openbao_fullname }}-0 within {{ openbao_init_timeout }}s
+        ({{ _st.error | default('') }}). The installer changed nothing. Check that they are Running
+        (kubectl -n {{ openbao_namespace }} get pods) and that the NetworkPolicy and DNS let
+        {{ openbao_fullname }}-0 reach them on port 8200, then re-run the install.
+      init_failed: >-
+        bao operator init failed in pod {{ openbao_fullname }}-0 before OpenBao was initialized:
+        {{ _st.error | default('') }}. Nothing was initialized; fix the cause and re-run the install.
+      concurrent_init: >-
+        {{ _st.error | default('') }}. OpenBao was initialized by another installer run (or by
+        hand) between this run's status check and its init. That run received the unseal shares
+        and the root token, not this one. Find it; if nobody holds the shares, see {{ _runbook }},
+        "Lost unseal shares".
+      missing_bootstrap: >-
+        OpenBao is initialized and unsealed, but bootstrap markers are missing:
+        {{ _st.missing | default('') }}. The root token was revoked after the first bootstrap, so
+        the installer cannot repair this (and no standing privileged token exists). Mint a
+        temporary root token in pod {{ openbao_fullname }}-0 ({{ _runbook }}, "Change the bootstrap
+        (generate-root)", steps 1-3), then, in that shell, converge the bootstrap (it revokes the
+        token when done): printf '%s\n' "$BAO_TOKEN" | {{ _openbao_bootstrap_apply_cmd }}
+      unreachable: >-
+        Cannot read the OpenBao state from pod {{ openbao_fullname }}-0 ({{ _st.error | default('') }}).
+        Check kubectl -n {{ openbao_namespace }} logs {{ openbao_fullname }}-0 -c openbao.
+      bad_params: "bootstrap.sh rejected its parameters: {{ _st.error | default('') }}"
+      uninitialized: >-
+        OpenBao is not initialized. Run ./es_auto_installer.sh install platform --env {{ _env }}
+        from an interactive terminal to initialize it.
+      exec_failed: >-
+        Running bootstrap.sh in pod {{ openbao_fullname }}-0 failed without a result
+        ({{ _st.error | default('') }}). If raw script output was shown on the terminal, it may
+        contain the unseal shares: keep them. If this happened during init (connection lost), check
+        kubectl -n {{ openbao_namespace }} exec {{ openbao_fullname }}-0 -c openbao -- bao status:
+        initialized=false means nothing happened, re-run the install. initialized=true means the
+        unseal shares were never shown and are lost: ./es_auto_installer.sh teardown openbao
+        --env {{ _env }} -- -e openbao_teardown_delete_data=true, then install again
+        ({{ _runbook }}, "Lost unseal shares"). The script revokes the root token on exit; if it
+        was killed, also follow "Revoke a leftover root token".
+  ansible.builtin.fail:
+    msg: "{{ _messages[_st.state] | default('Unexpected OpenBao bootstrap state ' ~ _st.state ~ ': ' ~ (_st.error | default(''))) }}"
+  when: _st.state != 'ok'

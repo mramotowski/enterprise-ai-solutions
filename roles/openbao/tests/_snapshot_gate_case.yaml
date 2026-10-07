@@ -1,0 +1,36 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One snapshot_gate.yaml case of render_test.yaml (_case: {name, vars, active, expect?}).
+
+- name: "openbao | test | snapshot gate {{ _case.name }} | Reset"
+  ansible.builtin.set_fact:
+    _sg_failed: false
+    _sg_msg: ""
+
+- name: "openbao | test | snapshot gate {{ _case.name }} | Run snapshot_gate.yaml"
+  block:
+    - name: "openbao | test | snapshot gate {{ _case.name }} | Include"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: snapshot_gate.yaml
+        public: true
+      vars:
+        secrets_backend: "{{ _case.vars.secrets_backend | default('openbao') }}"
+        openbao_mode: "{{ _case.vars.openbao_mode | default('internal') }}"
+        openbao_backup_namespace: "{{ _case.vars.openbao_backup_namespace | default('openbao-backup') }}"
+  rescue:
+    - name: "openbao | test | snapshot gate {{ _case.name }} | Record"
+      ansible.builtin.set_fact:
+        _sg_failed: true
+        _sg_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "openbao | test | snapshot gate {{ _case.name }} | Assert"
+  ansible.builtin.assert:
+    that:
+      - (_openbao_snapshot_active | bool) == _case.active
+      - _sg_failed == (_case.expect is defined)
+      - _case.expect is not defined or _sg_msg is search(_case.expect)
+    fail_msg: "snapshot gate {{ _case.name }}: active={{ _openbao_snapshot_active }} failed={{ _sg_failed }} {{ _sg_msg }}"
+    quiet: true

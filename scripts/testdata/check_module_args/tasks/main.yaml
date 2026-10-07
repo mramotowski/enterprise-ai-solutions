@@ -1,0 +1,21 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fixture for scripts/check_module_args.py: every task has one unknown
+# argument, so the check must report 3 problems and exit 1.
+- name: Selector typo (plural is label_selectors)
+  kubernetes.core.k8s_info:
+    kind: Pod
+    label_selector:
+      - app=x
+
+- name: Assert option typo
+  ansible.builtin.assert:
+    that: true
+    fail_mesg: x
+
+- name: Include option typo
+  ansible.builtin.include_tasks:
+    file: x.yaml
+    task_from: y

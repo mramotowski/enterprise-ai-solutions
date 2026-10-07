@@ -1,0 +1,108 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — post_restore hook: restore the Raft snapshot the backup carried
+# (AD-14). See snapshot_backup.yaml for the profile entries.
+#
+# By the time post_restore hooks run, the backup engine has replaced PVC
+# openbao_backup_namespace/openbao_snapshot_pvc with the one in the backup. A Job
+# logs in as role 'backup' and runs `bao operator raft snapshot restore -force`:
+# OpenBao goes back to the state of the backup for EVERY layer's paths, so the
+# credentials match the restored databases. Then:
+#   - every pod still unsealed: done; ExternalSecrets on openbao-* stores are
+#     annotated force-sync so their Secrets follow now (openbao_snapshot_restore_force_sync);
+#   - pods sealed: the snapshot came from another keyring (another OpenBao, e.g.
+#     a rebuilt cluster). Unseal with the shares of the cluster that took the
+#     snapshot; the hook fails with the commands (docs/deploy/openbao.md,
+#     "Restore into a new cluster").
+
+- name: "openbao | snapshot | restore | Applicable?"
+  ansible.builtin.include_tasks: snapshot_gate.yaml
+
+- name: "openbao | snapshot | restore"
+  when: _openbao_snapshot_active | bool
+  block:
+    - name: "openbao | snapshot | restore | Find the restored snapshot PVC"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ openbao_snapshot_pvc }}"
+        namespace: "{{ openbao_backup_namespace }}"
+      register: _openbao_snap_pvc
+
+    - name: "openbao | snapshot | restore | Assert the backup carried the snapshot PVC"
+      ansible.builtin.assert:
+        that:
+          - _openbao_snap_pvc.resources | default([]) | length == 1
+        fail_msg: >-
+          No PVC {{ openbao_backup_namespace }}/{{ openbao_snapshot_pvc }} after the restore: the backup did
+          not include namespace {{ openbao_backup_namespace }} (add it to the profile's namespace_order and
+          the snapshot_backup.yaml pre_backup hook). OpenBao was not changed; its credentials may not
+          match the restored data.
+        quiet: true
+
+    - name: "openbao | snapshot | restore | Restore"
+      ansible.builtin.include_tasks: snapshot_job.yaml
+      vars:
+        _openbao_snapshot_mode: restore
+
+    # Followers install the snapshot through Raft, and a snapshot of another
+    # keyring seals them: let the cluster settle before reading the state.
+    - name: "openbao | snapshot | restore | Let the followers apply the snapshot"
+      ansible.builtin.pause:
+        seconds: "{{ openbao_snapshot_settle_seconds }}"
+
+    # Every expected pod, Running or not: one that is not checked counts as not
+    # unsealed (snapshot_restore_check.yaml).
+    - name: "openbao | snapshot | restore | List server pods"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ openbao_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=openbao"
+          - "app.kubernetes.io/instance={{ openbao_helm_release_name }}"
+          - "component=server"
+      register: _openbao_snap_pods
+
+    - name: "openbao | snapshot | restore | Seal status of each Running pod"
+      kubernetes.core.k8s_exec:
+        namespace: "{{ openbao_namespace }}"
+        pod: "{{ item }}"
+        container: openbao
+        command: "bao status -format=json"
+      loop: >-
+        {{ _openbao_snap_pods.resources | default([]) | selectattr('status.phase', 'defined')
+           | selectattr('status.phase', 'eq', 'Running') | map(attribute='metadata.name') | sort }}
+      register: _openbao_snap_seal
+      vars:
+        _out: "{{ _openbao_snap_seal.stdout | default('') | trim }}"
+      until: _out.startswith('{')
+      retries: 15
+      delay: 4
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: "openbao | snapshot | restore | Pods not unsealed"
+      ansible.builtin.include_tasks: snapshot_restore_check.yaml
+
+    - name: "openbao | snapshot | restore | Sealed after the restore"
+      ansible.builtin.fail:
+        msg: >-
+          The OpenBao snapshot ({{ _openbao_snapshot_result.sha256 }}) was restored, and
+          {{ _openbao_snap_sealed | join(', ') }} {{ 'is' if _openbao_snap_sealed | length == 1 else 'are' }}
+          now sealed (or not running / not answering). A sealed pod means the snapshot came from an OpenBao
+          with other unseal keys. Unseal
+          every pod with the shares of the cluster that took the backup, pod 0 first:
+          {% for p in _openbao_snap_sealed %}kubectl -n {{ openbao_namespace }} exec -ti {{ p }} -c openbao --
+          bao operator unseal (run it threshold times){{ '; ' if not loop.last else '' }}{% endfor %}.
+          From then on those are this cluster's shares. Then restart the ESO controller
+          (kubectl -n {{ external_secrets_namespace | default('external-secrets') }} rollout restart deploy)
+          so the projected Secrets follow (docs/deploy/openbao.md, "Restore into a new cluster").
+      when: _openbao_snap_sealed | length > 0
+
+    - name: "openbao | snapshot | restore | Make ExternalSecrets follow the restored values"
+      ansible.builtin.include_tasks: snapshot_force_sync.yaml
+      when: openbao_snapshot_restore_force_sync | bool

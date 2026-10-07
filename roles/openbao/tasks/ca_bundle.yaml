@@ -1,0 +1,65 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — CA bundle ConfigMap (both modes)
+#
+# ConfigMap openbao_ca_bundle_configmap in openbao_namespace, key ca.crt: the
+# CA certificate that signed the OpenBao listener, and nothing else (no private
+# key). It is the trust source of the gateway (BackendTLSPolicy, route.yaml)
+# and of the in-cluster OpenBao clients (ESO, the layer worker Jobs).
+#   internal  copied from Secret openbao_tls_ca_secret_name (cert-manager CA;
+#             the Secret also holds the CA key, so it is read under no_log)
+#   external  the PEM file openbao_ca_file on the installer host
+# Re-applied on every install, so a renewed CA reaches the bundle.
+
+- name: "openbao | CA bundle | Read the CA Secret (internal mode)"
+  when: not (_openbao_external | bool)
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ openbao_tls_ca_secret_name }}"
+    namespace: "{{ openbao_namespace }}"
+  register: _openbao_ca_secret_for_bundle
+  no_log: true
+
+# Only the certificate leaves the Secret; ca.crt of a self-signed CA is the CA
+# itself (tls.crt as a fallback).
+- name: "openbao | CA bundle | Extract the CA certificate"
+  vars:
+    _data: >-
+      {{ (_openbao_ca_secret_for_bundle.resources | default([{}]) | first).data | default({})
+         if not (_openbao_external | bool) else {} }}
+  ansible.builtin.set_fact:
+    _openbao_ca_pem: >-
+      {{ lookup('ansible.builtin.file', _openbao_ca_file) if _openbao_external | bool
+         else ((_data['ca.crt'] | default(_data['tls.crt'] | default(''))) | b64decode) }}
+  no_log: true
+
+- name: "openbao | CA bundle | Assert a certificate and no key"
+  ansible.builtin.assert:
+    that:
+      - "'-----BEGIN CERTIFICATE-----' in _openbao_ca_pem"
+      - "'PRIVATE KEY' not in _openbao_ca_pem"
+    fail_msg: >-
+      No usable OpenBao CA certificate for ConfigMap {{ openbao_ca_bundle_configmap }}
+      ({{ ('openbao_ca_file ' ~ _openbao_ca_file) if _openbao_external | bool
+          else ('Secret ' ~ openbao_namespace ~ '/' ~ openbao_tls_ca_secret_name ~ ' key ca.crt') }}):
+      it must hold a PEM certificate and no private key.
+    quiet: true
+
+- name: "openbao | CA bundle | Apply ConfigMap {{ openbao_ca_bundle_configmap }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ openbao_ca_bundle_configmap }}"
+        namespace: "{{ openbao_namespace }}"
+        labels:
+          app.kubernetes.io/name: openbao
+          app.kubernetes.io/component: ca-bundle
+          app.kubernetes.io/managed-by: ai-solutions-installer
+      data:
+        ca.crt: "{{ _openbao_ca_pem | trim ~ '\n' }}"

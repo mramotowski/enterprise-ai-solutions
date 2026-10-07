@@ -1,0 +1,182 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — run the snapshot Job once (_openbao_snapshot_mode: save | restore)
+# and report its result. Included by snapshot_backup.yaml / snapshot_restore.yaml.
+#
+# Ensures what the Job mounts in openbao_backup_namespace (namespace, SA, script
+# ConfigMap, a copy of the CA bundle, and - for save - the PVC), runs the Job,
+# reads its one-line JSON result from the pod log (files/snapshot.sh prints no
+# secret) and deletes the Job, so no pod holds the PVC when a restore replaces
+# it. Sets _openbao_snapshot_result.
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Namespace {{ openbao_backup_namespace }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ openbao_backup_namespace }}"
+        labels: >-
+          {{ {'pod-security.kubernetes.io/enforce': 'restricted',
+              'pod-security.kubernetes.io/audit': 'restricted',
+              'pod-security.kubernetes.io/warn': 'restricted'} if enforce_pss | default(false) | bool else {} }}
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | ServiceAccount {{ openbao_backup_sa }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ openbao_backup_sa }}"
+        namespace: "{{ openbao_backup_namespace }}"
+      automountServiceAccountToken: false
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Script ConfigMap"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ openbao_snapshot_script_configmap }}"
+        namespace: "{{ openbao_backup_namespace }}"
+      data:
+        snapshot.sh: "{{ lookup('ansible.builtin.file', 'snapshot.sh') }}"
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Read the OpenBao CA bundle"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: "{{ openbao_ca_bundle_configmap }}"
+    namespace: "{{ openbao_namespace }}"
+  register: _openbao_snap_ca
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Assert the CA bundle exists"
+  ansible.builtin.assert:
+    that:
+      - _openbao_snap_ca.resources | default([]) | length == 1
+      - "'-----BEGIN CERTIFICATE-----' in (_openbao_snap_ca.resources[0].data | default({})).get('ca.crt', '')"
+    fail_msg: >-
+      ConfigMap {{ openbao_namespace }}/{{ openbao_ca_bundle_configmap }} (the OpenBao CA) is missing:
+      is OpenBao installed in this cluster? Run ./es_auto_installer.sh install platform first.
+    quiet: true
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | CA bundle copy for the Job"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ openbao_ca_bundle_configmap }}"
+        namespace: "{{ openbao_backup_namespace }}"
+      data:
+        ca.crt: "{{ _openbao_snap_ca.resources[0].data['ca.crt'] }}"
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Snapshot PVC"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{ openbao_snapshot_pvc }}"
+        namespace: "{{ openbao_backup_namespace }}"
+        labels:
+          app.kubernetes.io/name: openbao-snapshot
+          app.kubernetes.io/part-of: openbao
+      spec: >-
+        {{ {'accessModes': ['ReadWriteOnce'],
+            'resources': {'requests': {'storage': openbao_snapshot_storage_size}}}
+           | combine({'storageClassName': openbao_storage_class} if openbao_storage_class | default('', true) | length > 0 else {}) }}
+  when: _openbao_snapshot_mode == 'save'
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Remove a previous Job"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: "{{ openbao_snapshot_job_name }}-{{ _openbao_snapshot_mode }}"
+    namespace: "{{ openbao_backup_namespace }}"
+    delete_options:
+      propagationPolicy: Foreground
+    wait: true
+    wait_timeout: 120
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Run the Job"
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'snapshot-job.yaml.j2') | from_yaml }}"
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Wait for the Job"
+  kubernetes.core.k8s_info:
+    api_version: batch/v1
+    kind: Job
+    name: "{{ openbao_snapshot_job_name }}-{{ _openbao_snapshot_mode }}"
+    namespace: "{{ openbao_backup_namespace }}"
+  register: _openbao_snap_job
+  until: >-
+    _openbao_snap_job.resources | default([]) | length == 1 and
+    ((_openbao_snap_job.resources[0].status.succeeded | default(0) | int) > 0 or
+     (_openbao_snap_job.resources[0].status.failed | default(0) | int) > 0 or
+     (_openbao_snap_job.resources[0].status.conditions | default([])
+      | selectattr('type', 'eq', 'Failed') | selectattr('status', 'eq', 'True') | list | length) > 0)
+  retries: "{{ openbao_snapshot_wait_retries }}"
+  delay: "{{ openbao_snapshot_wait_delay }}"
+  failed_when: false
+
+# files/snapshot.sh prints no secret: its last line is the JSON result.
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Read the Job log"
+  kubernetes.core.k8s_log:
+    namespace: "{{ openbao_backup_namespace }}"
+    label_selectors:
+      - "job-name={{ openbao_snapshot_job_name }}-{{ _openbao_snapshot_mode }}"
+    container: snapshot
+  register: _openbao_snap_log
+  failed_when: false
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Parse the result"
+  ansible.builtin.include_tasks: snapshot_result.yaml
+
+# Never delete a Job that may still be writing (a restore in progress): stop
+# with instructions instead.
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Fail on a Job that is still running"
+  ansible.builtin.fail:
+    msg: >-
+      The snapshot Job {{ openbao_backup_namespace }}/{{ openbao_snapshot_job_name }}-{{ _openbao_snapshot_mode }}
+      did not finish within {{ (openbao_snapshot_wait_retries | int) * (openbao_snapshot_wait_delay | int) }}s and was
+      left running. Watch it (kubectl -n {{ openbao_backup_namespace }} logs -f job/{{ openbao_snapshot_job_name }}-{{ _openbao_snapshot_mode }}),
+      then delete it and re-run.
+  when: not (_openbao_snapshot_job_done | bool)
+
+# Gone before the backup snapshots the PVC and before a restore deletes it.
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Delete the Job"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: "{{ openbao_snapshot_job_name }}-{{ _openbao_snapshot_mode }}"
+    namespace: "{{ openbao_backup_namespace }}"
+    delete_options:
+      propagationPolicy: Foreground
+    wait: true
+    wait_timeout: 120
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Assert the Job succeeded"
+  ansible.builtin.assert:
+    that:
+      - _openbao_snapshot_job_ok | bool
+      - _openbao_snapshot_result.result == ('saved' if _openbao_snapshot_mode == 'save' else 'restored')
+    fail_msg: >-
+      OpenBao snapshot {{ _openbao_snapshot_mode }} failed at '{{ _openbao_snapshot_result.stage | default('?') }}':
+      {{ _openbao_snapshot_result.error | default('') }}. Check that OpenBao is unsealed, that role
+      'backup' binds {{ openbao_backup_namespace }}/{{ openbao_backup_sa }} (an install bootstrapped before
+      the snapshot namespace existed binds namespace {{ openbao_namespace }}: see docs/deploy/openbao.md,
+      "Change the bootstrap (generate-root)") and that the NetworkPolicy admits {{ openbao_backup_namespace }}.
+    success_msg: >-
+      OpenBao snapshot {{ _openbao_snapshot_result.result }}: {{ _openbao_snapshot_result.bytes }} bytes,
+      sha256 {{ _openbao_snapshot_result.sha256 }} ({{ openbao_backup_namespace }}/{{ openbao_snapshot_pvc }}).

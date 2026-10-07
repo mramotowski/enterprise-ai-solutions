@@ -1,0 +1,33 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — route prerequisites (openbao_route_enabled, internal mode).
+# Read-only. Included by install_internal.yaml before anything is created or
+# initialized, so a missing Envoy Gateway fails the run before OpenBao init,
+# and again by route.yaml right before the apply.
+
+- name: "openbao | route | Check the Gateway API and Envoy Gateway CRDs"
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: "{{ item }}"
+  loop:
+    - httproutes.gateway.networking.k8s.io
+    - backendtlspolicies.gateway.networking.k8s.io
+    - securitypolicies.gateway.envoyproxy.io
+  register: _openbao_route_crds
+
+- name: "openbao | route | Assert BackendTLSPolicy v1 is served"
+  vars:
+    _btls: "{{ (_openbao_route_crds.results[1].resources | default([{}]) | first) }}"
+    _missing: "{{ _openbao_route_crds.results | rejectattr('resources') | map(attribute='item') | list }}"
+  ansible.builtin.assert:
+    that:
+      - _missing | length == 0
+      - _btls.spec.versions | default([]) | selectattr('name', 'eq', 'v1') | selectattr('served') | list | length == 1
+    fail_msg: >-
+      openbao_route_enabled needs Envoy Gateway with Gateway API v1.4+ (BackendTLSPolicy
+      gateway.networking.k8s.io/v1). Missing CRDs: {{ _missing | join(', ') or 'none' }}. Install the
+      envoy_gateway component first, or set openbao_route_enabled: false.
+    quiet: true

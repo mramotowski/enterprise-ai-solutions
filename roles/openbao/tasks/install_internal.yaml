@@ -1,0 +1,248 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Install (openbao_mode: internal), included by install.yaml after
+# preflight.yaml.
+#
+# Installs the openbao/openbao chart with integrated Raft, listener TLS from a
+# cert-manager CA owned by this role and an ingress NetworkPolicy. The result is
+# running OpenBao pods, which init.yaml then initializes, unseals and
+# bootstraps (once; later runs only check). Then the optional gateway route
+# (route.yaml: applied with openbao_route_enabled, pruned without).
+
+# Before any change: a route that cannot be published must not fail the run
+# only after OpenBao was initialized.
+- name: "openbao | Preflight — route prerequisites"
+  ansible.builtin.include_tasks: route_preflight.yaml
+  when: openbao_route_enabled | default(false) | bool
+
+# A fresh install always ends in init, which needs an interactive terminal:
+# check that before anything is created. init.yaml checks again before init.
+- name: "openbao | Check for an existing StatefulSet"
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: StatefulSet
+    name: "{{ openbao_fullname }}"
+    namespace: "{{ openbao_namespace }}"
+  register: _openbao_sts_before
+
+- name: "openbao | Preflight — init prerequisites (fresh install)"
+  ansible.builtin.include_tasks: tty_preflight.yaml
+  when: _openbao_sts_before.resources | default([]) | length == 0
+
+# Lowering openbao_replicas needs the Raft peers removed first.
+- name: "openbao | Preflight — replica count change"
+  ansible.builtin.include_tasks: replicas_guard.yaml
+
+# An upgrade restarts pods: start only from a healthy, bootstrapped OpenBao.
+- name: "openbao | Preflight — upgrade starts from a healthy OpenBao"
+  ansible.builtin.include_tasks: upgrade_precheck.yaml
+  when:
+    - openbao_upgrade | bool
+    - (_openbao_current_replicas | int) > 0
+
+# The rollout pauses for each pod's unseal: no terminal, no change at all.
+- name: "openbao | Preflight — upgrade terminal"
+  ansible.builtin.include_tasks: tty_interactive.yaml
+  vars:
+    _openbao_tty_purpose: >-
+      the OpenBao upgrade pauses until you have unsealed each restarted or new pod
+    _openbao_tty_hint: "Nothing was changed."
+  when:
+    - openbao_upgrade | bool
+    - (_openbao_current_replicas | int) > 0
+
+# ── Namespace ─────────────────────────────────────────────────────────────────
+# Never enrolled in Istio ambient: OpenBao terminates its own TLS and its
+# clients pin openbao-ca.
+
+- name: "openbao | Read existing namespace"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: "{{ openbao_namespace }}"
+  register: _openbao_ns
+
+- name: "openbao | Preflight — namespace not enrolled in Istio"
+  ansible.builtin.assert:
+    that:
+      - "'istio.io/dataplane-mode' not in (_openbao_ns.resources[0].metadata.labels | default({}) if _openbao_ns.resources | default([]) | length > 0 else {})"
+    fail_msg: >-
+      Namespace '{{ openbao_namespace }}' carries the istio.io/dataplane-mode label.
+      OpenBao must not be enrolled in the mesh (it terminates its own TLS). Remove it with
+      kubectl label namespace {{ openbao_namespace }} istio.io/dataplane-mode- and re-run.
+    quiet: true
+
+- name: "openbao | Ensure namespace"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ openbao_namespace }}"
+
+# restricted: the chart values run the server non-root with RuntimeDefault
+# seccomp, no privilege escalation and all capabilities dropped; the injector,
+# CSI DaemonSet and snapshot agent are disabled.
+- name: "openbao | Label namespace — PSS"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ openbao_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "restricted"
+          pod-security.kubernetes.io/audit: "restricted"
+          pod-security.kubernetes.io/warn: "restricted"
+  when: enforce_pss | default(false) | bool
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+
+- name: "openbao | Listener TLS"
+  ansible.builtin.include_tasks: tls.yaml
+
+- name: "openbao | CA bundle ConfigMap"
+  ansible.builtin.include_tasks: ca_bundle.yaml
+
+# ── Bootstrap script and role ServiceAccounts ────────────────────────────────
+
+# Mounted read-only into the server pods (chart extraVolumes), so the exec
+# that runs it carries no script in its argv. The pods must not start before it
+# exists (the volume mount would block them).
+- name: "openbao | Bootstrap script ConfigMap"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ openbao_bootstrap_configmap }}"
+        namespace: "{{ openbao_namespace }}"
+      data:
+        bootstrap.sh: "{{ lookup('ansible.builtin.file', 'bootstrap.sh') }}"
+        tls-reload.sh: "{{ lookup('ansible.builtin.file', 'tls-reload.sh') }}"
+
+# The snapshot Job's namespace (backup hooks, tasks/snapshot_*.yaml): only what
+# backups capture lives there, never the live OpenBao objects. Created here
+# because role 'backup' binds its ServiceAccount.
+- name: "openbao | Snapshot namespace"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ openbao_backup_namespace }}"
+        labels: >-
+          {{ {'pod-security.kubernetes.io/enforce': 'restricted',
+              'pod-security.kubernetes.io/audit': 'restricted',
+              'pod-security.kubernetes.io/warn': 'restricted'} if enforce_pss | default(false) | bool else {} }}
+  when: openbao_backup_namespace != openbao_namespace
+
+# Earlier installs created the snapshot ServiceAccount in openbao_namespace.
+- name: "openbao | Remove the snapshot ServiceAccount from {{ openbao_namespace }} (moved)"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: ServiceAccount
+    name: "{{ openbao_backup_sa }}"
+    namespace: "{{ openbao_namespace }}"
+  when: openbao_backup_namespace != openbao_namespace
+
+# The Kubernetes-auth roles 'operator' and 'backup' bind these (AD-7). Layer
+# importer SAs are created by their migration step, not here.
+- name: "openbao | ServiceAccounts for the operator and backup roles"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace }}"
+  loop:
+    - {name: "{{ openbao_operator_sa }}", namespace: "{{ openbao_operator_namespace }}"}
+    - {name: "{{ openbao_backup_sa }}", namespace: "{{ openbao_backup_namespace }}"}
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+
+# ── Helm ──────────────────────────────────────────────────────────────────────
+
+- name: "openbao | Add OpenBao Helm repo"
+  kubernetes.core.helm_repository:
+    name: openbao
+    repo_url: "{{ openbao_chart_repo_url }}"
+  register: _openbao_repo
+  until: _openbao_repo is succeeded
+  retries: "{{ helm_retries }}"
+  delay: 15
+
+# helm_wait is safe here: the chart's OnDelete update strategy means Helm does
+# not wait for StatefulSet pods to become Ready (sealed pods never are).
+- name: "openbao | Deploy OpenBao"
+  kubernetes.core.helm:
+    name: "{{ openbao_helm_release_name }}"
+    chart_ref: openbao/openbao
+    release_namespace: "{{ openbao_namespace }}"
+    create_namespace: false
+    chart_version: "{{ openbao_chart_version }}"
+    wait: "{{ helm_wait }}"
+    timeout: "{{ helm_timeout }}"
+    values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+  register: _openbao_helm
+  until: _openbao_helm is succeeded
+  retries: "{{ helm_retries }}"
+  delay: 15
+
+# ── Wait for Running (not Ready: uninitialized/sealed pods fail readiness) ────
+
+- name: "openbao | Wait for server pods to be Running (container running, few restarts)"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ openbao_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/name=openbao"
+      - "app.kubernetes.io/instance={{ openbao_helm_release_name }}"
+      - "component=server"
+  register: _openbao_pods
+  until:
+    - (_openbao_healthy_pod_count | int) == (openbao_replicas | int)
+  retries: "{{ openbao_pods_wait_retries }}"
+  delay: "{{ openbao_pods_wait_delay }}"
+
+# ── Certificate reload, upgrade rollout ──────────────────────────────────────
+
+# Pods started before the current server certificate serve the old one until
+# SIGHUP (the tls-reloader sidecar does this too, once it runs in every pod).
+- name: "openbao | Serve the current listener certificate"
+  ansible.builtin.include_tasks: tls_reload.yaml
+  vars:
+    _openbao_tls_mode: reload-if-stale
+
+# openbao_upgrade: restart pods on an old revision and unseal new ones, one at
+# a time; otherwise only report them.
+- name: "openbao | Rollout"
+  ansible.builtin.include_tasks: rollout.yaml
+
+# ── Init, unseal, bootstrap, root revoke ──────────────────────────────────────
+
+- name: "openbao | Init and bootstrap"
+  ansible.builtin.include_tasks: init.yaml
+
+# ── Gateway route (openbao_route_enabled) ─────────────────────────────────────
+
+- name: "openbao | Route"
+  ansible.builtin.include_tasks: route.yaml
+
+- name: "openbao | Install complete"
+  ansible.builtin.debug:
+    msg: >-
+      OpenBao {{ openbao_replicas }} replica(s) running, unsealed and bootstrapped in
+      namespace '{{ openbao_namespace }}' (https://{{ openbao_fullname }}.{{ openbao_namespace }}.svc:8200,
+      CA in ConfigMap '{{ openbao_ca_bundle_configmap }}'){{ (', route https://' ~ openbao_route_hostname)
+      if openbao_route_enabled | default(false) | bool else '' }}. Runbook: docs/deploy/openbao.md.

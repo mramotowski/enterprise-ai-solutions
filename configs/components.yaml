@@ -119,6 +119,21 @@ components:
     enabled: "{{ velero_enabled | default(false) | bool }}"
     depends_on: []
 
+  # Secrets backend (opt-in, secrets_backend: openbao). With openbao_mode
+  # internal, openbao installs the chart with listener TLS from the platform
+  # cert-manager CA (hence cert_manager); with external it only validates the
+  # operator's OpenBao. ESO needs OpenBao to build its ClusterSecretStore.
+  # Both are skipped with the default secrets_backend: local.
+  - name: openbao
+    layer: platform
+    enabled: "{{ (secrets_backend | default('local')) == 'openbao' }}"
+    depends_on: [cert_manager]
+
+  - name: external_secrets
+    layer: platform
+    enabled: "{{ (secrets_backend | default('local')) == 'openbao' }}"
+    depends_on: [openbao]
+
   # --- Inference ---
   # Only nri_cpu_balloons remains here — it configures kubelet-level CPU policy
   # and is tightly coupled to the kubernetes role. All other inference components

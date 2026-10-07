@@ -1,0 +1,48 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One preflight failure case of render_test.yaml (_case: {name, vars, expect}).
+
+- name: "openbao | test | {{ _case.name }} | Reset result"
+  ansible.builtin.set_fact:
+    _pf_msg: ""
+    _pf_failed: false
+
+- name: "openbao | test | {{ _case.name }} | Run preflight"
+  block:
+    - name: "openbao | test | {{ _case.name }} | Include preflight"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: preflight.yaml
+      vars:
+        openbao_replicas: "{{ _case.vars.openbao_replicas | default(1) }}"
+        openbao_mode: "{{ _case.vars.openbao_mode | default('internal') }}"
+        cert_manager_enabled: "{{ _case.vars.cert_manager_enabled | default(true) }}"
+        openbao_key_shares: "{{ _case.vars.openbao_key_shares | default(5) }}"
+        openbao_key_threshold: "{{ _case.vars.openbao_key_threshold | default(3) }}"
+        openbao_cluster_id: "{{ _case.vars.openbao_cluster_id | default('cluster-a' if _case.vars.openbao_mode | default('internal') == 'external' else '') }}"
+        openbao_layers: "{{ _case.vars.openbao_layers | default(['erag']) }}"
+        openbao_init_timeout: "{{ _case.vars.openbao_init_timeout | default(120) }}"
+        openbao_operator_token_ttl: "{{ _case.vars.openbao_operator_token_ttl | default('1h') }}"
+        openbao_kv_mount: "{{ _case.vars.openbao_kv_mount | default('intel-ai') }}"
+        erag_secrets_namespace: "{{ _case.vars.erag_secrets_namespace | default('erag-secrets') }}"
+        openbao_operator_sa: "{{ _case.vars.openbao_operator_sa | default('openbao-operator') }}"
+        openbao_auth_mount: "{{ _case.vars.openbao_auth_mount | default('kubernetes') }}"
+        openbao_route_enabled: "{{ _case.vars.openbao_route_enabled | default(false) }}"
+        openbao_address: "{{ _case.vars.openbao_address | default('https://openbao.example.com:8200') }}"
+        # '@tmp/' = the render test's temp dir (fake PEM files written there).
+        openbao_ca_file: "{{ _case.vars.openbao_ca_file | default('@tmp/ca.pem') | regex_replace('^@tmp/', _tmp.path ~ '/') }}"
+  rescue:
+    - name: "openbao | test | {{ _case.name }} | Record failure"
+      ansible.builtin.set_fact:
+        _pf_failed: true
+        _pf_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "openbao | test | {{ _case.name }} | Assert preflight failed clearly"
+  ansible.builtin.assert:
+    that:
+      - _pf_failed
+      - _pf_msg is search(_case.expect)
+    fail_msg: "Expected preflight to fail with /{{ _case.expect }}/, got failed={{ _pf_failed }}: {{ _pf_msg }}"
+    quiet: true

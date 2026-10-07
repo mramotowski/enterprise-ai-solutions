@@ -1,0 +1,93 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao route (openbao_mode: internal, openbao_route_enabled). Rendered by
+# tasks/route.yaml and tests/render_test.yaml.
+#
+# openbao.<base_domain_name> on the gateway's https listener -> the active
+# OpenBao pod, TLS re-encrypted to the backend and checked against the role CA
+# (ConfigMap {{ openbao_ca_bundle_configmap }}). Only this allowlist is forwarded;
+# every other path (sys/generate-root, sys/unseal, sys/init, sys/seal-status,
+# sys/rekey, sys/health, ...) matches no rule and gets Envoy's 404:
+#   /v1/<kv mount>/...                      KV v2 data and metadata
+#   /v1/sys/internal/ui/mounts/<kv mount>   mount lookup of the bao kv CLI
+#   /v1/auth/<auth mount>/login             Kubernetes-auth login
+#   /v1/auth/token/{lookup,renew,revoke}-self
+# OpenBao authenticates every request itself, so the gateway's JWT policy is
+# switched off for this route (SecurityPolicy without auth).
+{% set _paths = [
+  {'type': 'PathPrefix', 'value': '/v1/' ~ openbao_kv_mount},
+  {'type': 'PathPrefix', 'value': '/v1/sys/internal/ui/mounts/' ~ openbao_kv_mount},
+  {'type': 'Exact', 'value': '/v1/auth/' ~ _openbao_auth_mount ~ '/login'},
+  {'type': 'Exact', 'value': '/v1/auth/token/lookup-self'},
+  {'type': 'Exact', 'value': '/v1/auth/token/renew-self'},
+  {'type': 'Exact', 'value': '/v1/auth/token/revoke-self'},
+] %}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ openbao_route_name | to_json }}
+  namespace: {{ openbao_namespace | to_json }}
+  labels:
+    app.kubernetes.io/name: openbao
+    app.kubernetes.io/component: route
+spec:
+  parentRefs:
+    # The HTTPS listener only: without sectionName the route would also attach
+    # to the plaintext :80 listener.
+    - name: {{ openbao_route_gateway_name | to_json }}
+      namespace: {{ openbao_route_gateway_namespace | to_json }}
+      sectionName: https
+  hostnames:
+    - {{ openbao_route_hostname | to_json }}
+  rules:
+    - matches:
+{% for p in _paths %}
+        - path:
+            type: {{ p.type }}
+            value: {{ p.value | to_json }}
+{% endfor %}
+      filters:
+        # HSTS, as on the keycloak route: browsers never retry this host over HTTP.
+        - type: ResponseHeaderModifier
+          responseHeaderModifier:
+            set:
+              - name: Strict-Transport-Security
+                value: "max-age=31536000; includeSubDomains"
+      backendRefs:
+        - name: {{ openbao_route_backend_service | to_json }}
+          port: 8200
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: {{ openbao_route_backend_tls_policy_name | to_json }}
+  namespace: {{ openbao_namespace | to_json }}
+  labels:
+    app.kubernetes.io/name: openbao
+    app.kubernetes.io/component: route
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: {{ openbao_route_backend_service | to_json }}
+  validation:
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: {{ openbao_ca_bundle_configmap | to_json }}
+    hostname: {{ openbao_route_backend_hostname | to_json }}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: {{ openbao_route_security_policy_name | to_json }}
+  namespace: {{ openbao_namespace | to_json }}
+  labels:
+    app.kubernetes.io/name: openbao
+    app.kubernetes.io/component: route
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: {{ openbao_route_name | to_json }}

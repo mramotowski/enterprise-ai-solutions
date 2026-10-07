@@ -1,0 +1,239 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One render case of render_test.yaml (_case: {name, replicas, route,
+# storage_class?, reloader? (default true)}).
+
+- name: "openbao | test | {{ _case.name }} | Preflight + resolve names"
+  ansible.builtin.include_role:
+    name: "{{ _role_dir }}"
+    tasks_from: preflight.yaml
+    public: true
+  vars:
+    openbao_replicas: "{{ _case.replicas }}"
+    openbao_route_enabled: "{{ _case.route }}"
+
+- name: "openbao | test | {{ _case.name }} | Render values"
+  ansible.builtin.template:
+    src: "{{ _role_dir }}/templates/values.yaml.j2"
+    dest: "{{ _tmp.path }}/values-{{ _case.name }}.yaml"
+    mode: "0600"
+  vars:
+    openbao_replicas: "{{ _case.replicas }}"
+    openbao_route_enabled: "{{ _case.route }}"
+    openbao_storage_class: "{{ _case.storage_class | default('') }}"
+    openbao_tls_reloader_enabled: "{{ _case.reloader | default(true) }}"
+
+- name: "openbao | test | {{ _case.name }} | helm template"
+  ansible.builtin.command:
+    argv:
+      - helm
+      - template
+      - "{{ openbao_helm_release_name }}"
+      - "{{ _tmp.path }}/chart/openbao"
+      - --namespace
+      - "{{ openbao_namespace }}"
+      - --kube-version
+      - "1.32.0"
+      - -f
+      - "{{ _tmp.path }}/values-{{ _case.name }}.yaml"
+  environment: "{{ _helm_env }}"
+  register: _rendered
+  changed_when: false
+
+- name: "openbao | test | {{ _case.name }} | Assert rendered objects"
+  vars:
+    _n: "{{ _case.replicas | int }}"
+    _fn: "{{ openbao_fullname }}"
+    _docs: "{{ _rendered.stdout | ansible.builtin.from_yaml_all | select | list }}"
+    _kinds: "{{ _docs | map(attribute='kind') | list }}"
+    _sts: "{{ _docs | selectattr('kind', 'eq', 'StatefulSet') | list }}"
+    _pod: "{{ _sts[0].spec.template.spec }}"
+    _ctr: "{{ _pod.containers | selectattr('name', 'eq', 'openbao') | first }}"
+    _env: "{{ dict(_ctr.env | selectattr('value', 'defined') | map(attribute='name') | zip(_ctr.env | selectattr('value', 'defined') | map(attribute='value'))) }}"
+    _hcl: "{{ (_docs | selectattr('kind', 'eq', 'ConfigMap') | selectattr('metadata.name', 'eq', _fn ~ '-config') | first).data['extraconfig-from-values.hcl'] }}"
+    _np: "{{ _docs | selectattr('kind', 'eq', 'NetworkPolicy') | list }}"
+    _np_api: "{{ _np[0].spec.ingress | selectattr('ports', 'equalto', [{'port': 8200, 'protocol': 'TCP'}]) | list }}"
+    _np_raft: "{{ _np[0].spec.ingress | selectattr('ports', 'equalto', [{'port': 8201, 'protocol': 'TCP'}]) | list }}"
+    _np_ns: "{{ _np_api[0].from | map(attribute='namespaceSelector.matchLabels') | map('dict2items') | flatten | selectattr('key', 'eq', 'kubernetes.io/metadata.name') | map(attribute='value') | list }}"
+    _server_labels: {app.kubernetes.io/name: openbao, app.kubernetes.io/instance: "{{ openbao_helm_release_name }}", component: server}
+    _anti_labels: {app.kubernetes.io/name: openbao, app.kubernetes.io/instance: "{{ openbao_helm_release_name }}"}
+    _anti: "{{ _pod.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution | default([]) }}"
+    _expected_ns: "{{ [openbao_namespace, 'external-secrets', 'openbao-backup', 'erag-secrets'] + (['envoy-gateway-system'] if _case.route else []) }}"
+    _reloader: "{{ _case.reloader | default(true) | bool }}"
+    _side: "{{ _pod.containers | selectattr('name', 'eq', 'tls-reloader') | list }}"
+    _tls_vol: "{{ _pod.volumes | selectattr('secret', 'defined') | selectattr('secret.secretName', 'eq', openbao_tls_server_secret_name) | list }}"
+    _tls_mnt: "{{ _ctr.volumeMounts | selectattr('mountPath', 'eq', openbao_tls_mount_dir) | list }}"
+    _pvc: "{{ _sts[0].spec.volumeClaimTemplates | selectattr('metadata.name', 'eq', 'data') | list }}"
+    _service_names: "{{ _docs | selectattr('kind', 'eq', 'Service') | map(attribute='metadata.name') | list }}"
+    _pod_addrs: "{{ range(_n | int) | map('string') | map('regex_replace', '^', _fn ~ '-') | map('regex_replace', '$', '.' ~ _fn ~ '-internal') | list }}"
+    _pod_addrs_ns: "{{ _pod_addrs | map('regex_replace', '$', '.' ~ openbao_namespace ~ '.svc') | list }}"
+  block:
+    - name: "openbao | test | {{ _case.name }} | Server StatefulSet"
+      ansible.builtin.assert:
+        that:
+          - _sts | length == 1
+          - _sts[0].metadata.name == _fn
+          - _sts[0].spec.template.metadata.labels['app.kubernetes.io/name'] == 'openbao'
+          - _sts[0].spec.template.metadata.labels['app.kubernetes.io/instance'] == openbao_helm_release_name
+          - _sts[0].spec.template.metadata.labels['component'] == 'server'
+          - _sts[0].spec.replicas == (_n | int)
+          - _sts[0].spec.podManagementPolicy == 'Parallel'
+          - _sts[0].spec.updateStrategy.type == 'OnDelete'
+          - _env.BAO_ADDR is match('^https://')
+          - _env.BAO_CACERT == openbao_tls_mount_dir ~ '/ca.crt'
+          - _ctr.env | selectattr('name', 'eq', 'BAO_RAFT_NODE_ID') | list | length == 1
+          - _pod.affinity.nodeAffinity == _platform_affinity.nodeAffinity
+          # One Raft voter per node only with more than one replica.
+          - (_pod.affinity == _platform_affinity) if (_n | int) == 1 else true
+          - (_anti | length == 0) if (_n | int) == 1 else (_anti | length == 1)
+          - (_n | int) == 1 or _anti[0].topologyKey == 'kubernetes.io/hostname'
+          - (_n | int) == 1 or _anti[0].labelSelector.matchLabels == _anti_labels
+          - not (_pod.hostNetwork | default(false))
+        fail_msg: "StatefulSet assertions failed: {{ _sts | to_json }}"
+        quiet: true
+
+    - name: "openbao | test | {{ _case.name }} | PSS restricted security context"
+      ansible.builtin.assert:
+        that:
+          - _pod.securityContext.runAsNonRoot
+          - _pod.securityContext.seccompProfile.type == 'RuntimeDefault'
+          - _ctr.securityContext.allowPrivilegeEscalation == false
+          - _ctr.securityContext.capabilities.drop == ['ALL']
+          - _ctr.securityContext.capabilities.add is not defined
+          - _pod.containers | length == (2 if _reloader else 1)
+          - _pod.containers | map(attribute='securityContext.allowPrivilegeEscalation') | list | unique == [false]
+          - _pod.containers | map(attribute='securityContext.capabilities.drop') | list | unique == [['ALL']]
+          - _pod.initContainers is not defined or (_pod.initContainers | length == 0)
+          - _pod.volumes | selectattr('hostPath', 'defined') | list | length == 0
+        quiet: true
+
+    - name: "openbao | test | {{ _case.name }} | No injector, CSI, snapshotAgent or UI"
+      ansible.builtin.assert:
+        that:
+          - "'MutatingWebhookConfiguration' not in _kinds"
+          - "'Deployment' not in _kinds"
+          - "'DaemonSet' not in _kinds"
+          - "'CronJob' not in _kinds"
+          - "'HTTPRoute' not in _kinds"
+          - "'Ingress' not in _kinds"
+          - (_fn ~ '-ui') not in _service_names
+          - (_fn ~ '-internal') in _service_names
+          - "'ui = false' in _hcl"
+        fail_msg: "Unexpected kinds/services: {{ _kinds }} / {{ _service_names }}"
+        quiet: true
+
+    - name: "openbao | test | {{ _case.name }} | Raft config with TLS listener and retry_join"
+      ansible.builtin.assert:
+        that:
+          - _hcl is search('storage "raft"')
+          - _hcl is not search('tls_disable')
+          - _hcl is search('tls_cert_file\s*=\s*"' ~ (openbao_tls_mount_dir ~ '/tls.crt') | regex_escape ~ '"')
+          - _hcl is search('tls_key_file\s*=\s*"' ~ (openbao_tls_mount_dir ~ '/tls.key') | regex_escape ~ '"')
+          - (_hcl | regex_findall('retry_join\s*\{') | length) == (_n | int)
+          - (_hcl | regex_findall('leader_ca_cert_file\s*=\s*"' ~ (openbao_tls_mount_dir ~ '/ca.crt') | regex_escape ~ '"') | length) == (_n | int)
+          - _pod_addrs | map('regex_replace', '^', 'https://') | map('regex_replace', '$', ':8200') | select('in', _hcl) | list | length == (_n | int)
+          - ('https://' ~ _fn ~ '-' ~ (_n | int) ~ '.' ~ _fn ~ '-internal') not in _hcl
+        fail_msg: "Raft HCL:\n{{ _hcl }}"
+        quiet: true
+
+    - name: "openbao | test | {{ _case.name }} | stdout file audit device and bootstrap peers"
+      ansible.builtin.assert:
+        that:
+          # AD-18, declared in the server config (OpenBao 2.7 rejects API-created audit devices).
+          - _hcl is search('audit\s+"file"\s+"' ~ openbao_audit_path ~ '"\s*\{\s*options\s*\{\s*file_path\s*=\s*"stdout"')
+          - _hcl is not search('unsafe_allow_api_audit_creation')
+          # generate-root runbook (no token exists after the root revoke).
+          - _hcl is search('disable_unauthed_generate_root_endpoints\s*=\s*false')
+          # bootstrap.sh unseals pods 1..N-1 from pod 0 at these addresses.
+          - _openbao_peer_addrs | length == (_n | int) - 1
+          - _openbao_peer_addrs == (_pod_addrs[1:] | map('regex_replace', '^', 'https://') | map('regex_replace', '$', ':8200') | list)
+        fail_msg: "HCL:\n{{ _hcl }}\npeers: {{ _openbao_peer_addrs }}"
+        quiet: true
+
+    - name: "openbao | test | {{ _case.name }} | Bootstrap script ConfigMap mounted read-only"
+      vars:
+        _cm_vol: "{{ _pod.volumes | selectattr('configMap', 'defined') | selectattr('configMap.name', 'eq', openbao_bootstrap_configmap) | list }}"
+        _cm_mnt: "{{ _ctr.volumeMounts | selectattr('name', 'eq', (_cm_vol[0].name if _cm_vol else '-')) | list }}"
+      ansible.builtin.assert:
+        that:
+          - _cm_vol | length == 1
+          - _cm_mnt | length == 1
+          - _cm_mnt[0].readOnly
+          - _cm_mnt[0].subPath is not defined
+          - (_cm_mnt[0].mountPath ~ '/bootstrap.sh') == openbao_bootstrap_script_path
+        fail_msg: "volumes {{ _pod.volumes }} mounts {{ _ctr.volumeMounts }}"
+        quiet: true
+
+    - name: "openbao | test | {{ _case.name }} | TLS mount and data PVC"
+      ansible.builtin.assert:
+        that:
+          - _tls_vol | length == 1
+          - _tls_mnt | length == 1
+          - _tls_mnt[0].readOnly
+          - _pvc | length == 1
+          - _pvc[0].spec.resources.requests.storage == openbao_storage_size
+          - openbao_storage_size == '10Gi'
+          - (_pvc[0].spec.storageClassName | default('')) == (_case.storage_class | default(''))
+        quiet: true
+
+    - name: "openbao | test | {{ _case.name }} | NetworkPolicy namespaces and ports"
+      ansible.builtin.assert:
+        that:
+          - _np | length == 1
+          - _np[0].metadata.name == _fn
+          - _np[0].spec.podSelector.matchLabels['app.kubernetes.io/name'] == 'openbao'
+          - _np[0].spec.ingress | length == 2
+          # 8200 from the allowed namespaces only.
+          - _np_api | length == 1
+          - _np_ns | sort == _expected_ns | sort
+          - _np_api[0].from | length == _expected_ns | length
+          - _np_api[0].from | rejectattr('namespaceSelector', 'defined') | list | length == 0
+          - _np_api[0].from | selectattr('podSelector', 'defined') | list | length == 0
+          # 8201 only from the OpenBao server pods (same namespace).
+          - _np_raft | length == 1
+          - _np_raft[0].from | length == 1
+          - _np_raft[0].from[0].keys() | list == ['podSelector']
+          - _np_raft[0].from[0].podSelector.matchLabels == _server_labels
+        fail_msg: "NetworkPolicy {{ _np | to_json }} (expected API namespaces {{ _expected_ns }})"
+        quiet: true
+
+    - name: "openbao | test | {{ _case.name }} | Server cert SANs"
+      ansible.builtin.assert:
+        that:
+          - (_pod_addrs + _pod_addrs_ns) is subset(_openbao_server_dns_names)
+          - (_fn ~ '-' ~ (_n | int) ~ '.' ~ _fn ~ '-internal') not in _openbao_server_dns_names
+          - ([_fn, _fn ~ '-internal', _fn ~ '.' ~ openbao_namespace ~ '.svc',
+              _fn ~ '-internal.' ~ openbao_namespace ~ '.svc',
+              _fn ~ '.' ~ openbao_namespace ~ '.svc.cluster.local']) is subset(_openbao_server_dns_names)
+          - "'127.0.0.1' in _openbao_server_ip_addresses"
+        fail_msg: "SANs: {{ _openbao_server_dns_names }}"
+        quiet: true
+
+    - name: "openbao | test | {{ _case.name }} | Image pinned, cert reloader sidecar"
+      vars:
+        _sm: "{{ (_side[0].volumeMounts | default([])) if _side else [] }}"
+      ansible.builtin.assert:
+        that:
+          - _ctr.image == openbao_image
+          - openbao_image == 'quay.io/openbao/openbao:2.7.0'
+          - _side | length == (1 if _reloader else 0)
+          - (_pod.shareProcessNamespace | default(false)) == _reloader
+          - not _reloader or _side[0].image == _ctr.image
+          - not _reloader or _side[0].command == ['/bin/sh', openbao_tls_reload_script_path, 'watch']
+          - not _reloader or _side[0].ports is not defined
+          - not _reloader or _side[0].securityContext.readOnlyRootFilesystem
+          - not _reloader or _side[0].securityContext.runAsNonRoot
+          - not _reloader or _side[0].securityContext.seccompProfile.type == 'RuntimeDefault'
+          - not _reloader or _side[0].resources.limits.memory is defined
+          # Only the public certificate files and the scripts, read-only, and a tmp dir.
+          - not _reloader or (_sm | selectattr('mountPath', 'eq', openbao_tls_mount_dir) | map(attribute='readOnly') | list == [true])
+          - not _reloader or (_sm | selectattr('mountPath', 'eq', openbao_tls_reload_script_path | dirname) | map(attribute='readOnly') | list == [true])
+          - not _reloader or (_sm | rejectattr('readOnly', 'defined') | map(attribute='mountPath') | list == ['/tmp'])
+          - not _reloader or (_side[0].env | selectattr('name', 'eq', 'OB_TLS_DIR') | map(attribute='value') | list == [openbao_tls_mount_dir])
+          - not _reloader or (_pod.volumes | selectattr('name', 'eq', 'tls-reloader-tmp') | list | length == 1)
+          # The reloader's mounts are volumes the chart created.
+          - not _reloader or (_sm | map(attribute='name') | reject('in', _pod.volumes | map(attribute='name') | list) | list | length == 0)
+        fail_msg: "sidecar {{ _side | to_json }} pod.shareProcessNamespace={{ _pod.shareProcessNamespace | default(false) }}"
+        quiet: true

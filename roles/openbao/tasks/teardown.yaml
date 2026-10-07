@@ -1,0 +1,271 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Teardown
+#
+# Both modes: remove the route objects (HTTPRoute, BackendTLSPolicy,
+# SecurityPolicy) and the CA bundle ConfigMap (internal mode: only after the
+# Helm uninstall succeeded).
+# External mode: also the operator ServiceAccount. The operator's OpenBao and
+# everything in it are left alone (the installer never wrote to it).
+# Internal mode, default: remove the release, the server Certificate/Secret and
+# the NetworkPolicy; keep the Raft PVCs, the namespace and the CA (Issuers, CA
+# Certificate, Secret openbao-ca), so a reinstall serves the kept data with the
+# same CA. Kept PVCs retain every stored secret.
+# -e openbao_teardown_delete_data=true deletes the PVCs, the CA and the
+# namespace too.
+
+- name: "openbao | teardown | openbao_mode"
+  ansible.builtin.include_tasks: assert_mode.yaml
+
+- name: "openbao | teardown | Mode"
+  ansible.builtin.set_fact:
+    _openbao_external: "{{ (openbao_mode | default('internal')) == 'external' }}"
+
+- name: "openbao | teardown | External mode"
+  when: _openbao_external | bool
+  block:
+    - name: "openbao | teardown | Remove the route objects"
+      ansible.builtin.include_tasks: route.yaml
+      vars:
+        _openbao_route_prune: true
+
+    - name: "openbao | teardown | Delete the CA bundle ConfigMap"
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: ConfigMap
+        name: "{{ openbao_ca_bundle_configmap }}"
+        namespace: "{{ openbao_namespace }}"
+        state: absent
+      failed_when: false
+
+    - name: "openbao | teardown | Delete the operator ServiceAccount"
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: ServiceAccount
+        name: "{{ openbao_operator_sa }}"
+        namespace: "{{ openbao_operator_namespace }}"
+        state: absent
+      failed_when: false
+
+    - name: "openbao | teardown | External mode — OpenBao left alone"
+      ansible.builtin.debug:
+        msg: >-
+          openbao_mode is external: removed ServiceAccount {{ openbao_operator_namespace }}/{{ openbao_operator_sa }}
+          and ConfigMap {{ openbao_namespace }}/{{ openbao_ca_bundle_configmap }}; namespace
+          '{{ openbao_namespace }}' is kept. Your OpenBao (mount, auth, policies, roles, stored secrets)
+          was not touched.
+
+- name: "openbao | teardown | Internal mode"
+  when: not (_openbao_external | bool)
+  block:
+    # Fails the teardown on error: TLS and NetworkPolicy must not be removed
+    # from under a release that is still there.
+    - name: "openbao | teardown | Uninstall Helm release"
+      kubernetes.core.helm:
+        name: "{{ openbao_helm_release_name }}"
+        release_namespace: "{{ openbao_namespace }}"
+        state: absent
+        wait: "{{ helm_wait }}"
+        timeout: "{{ helm_timeout }}"
+      register: _openbao_uninstall
+
+    # Only once the release is gone: the route and its CA must not disappear
+    # from under a running OpenBao when the uninstall fails.
+    - name: "openbao | teardown | Remove the route objects"
+      ansible.builtin.include_tasks: route.yaml
+      vars:
+        _openbao_route_prune: true
+
+    - name: "openbao | teardown | Delete the CA bundle ConfigMap"
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: ConfigMap
+        name: "{{ openbao_ca_bundle_configmap }}"
+        namespace: "{{ openbao_namespace }}"
+        state: absent
+      failed_when: false
+
+    # Normally removed with the release; deleted explicitly so a partial
+    # uninstall does not leave it behind. Cleanup of objects that may already be
+    # gone (or whose CRD is gone) is best effort.
+    - name: "openbao | teardown | Delete NetworkPolicy"
+      kubernetes.core.k8s:
+        api_version: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: "{{ openbao_fullname }}"
+        namespace: "{{ openbao_namespace }}"
+        state: absent
+      failed_when: false
+
+    # Re-issued from the kept CA on reinstall.
+    - name: "openbao | teardown | Delete server Certificate"
+      kubernetes.core.k8s:
+        api_version: cert-manager.io/v1
+        kind: Certificate
+        name: "{{ openbao_tls_server_cert_name }}"
+        namespace: "{{ openbao_namespace }}"
+        state: absent
+      failed_when: false
+
+    - name: "openbao | teardown | Delete server TLS Secret"
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Secret
+        name: "{{ openbao_tls_server_secret_name }}"
+        namespace: "{{ openbao_namespace }}"
+        state: absent
+      failed_when: false
+
+    - name: "openbao | teardown | Find PVCs"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ openbao_namespace }}"
+      register: _openbao_pvcs_all
+
+    # StatefulSet claims are named data-<fullname>-<ordinal>.
+    - name: "openbao | teardown | Select data PVCs"
+      ansible.builtin.set_fact:
+        _openbao_data_pvcs: >-
+          {{ _openbao_pvcs_all.resources | default([])
+             | selectattr('metadata.name', 'match', '^data-' ~ (openbao_fullname | regex_escape) ~ '-[0-9]+$') | list }}
+
+    # A running snapshot Job would keep its PVC busy; the PVC itself is data.
+    - name: "openbao | teardown | Delete snapshot Jobs"
+      kubernetes.core.k8s:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ openbao_snapshot_job_name }}-{{ item }}"
+        namespace: "{{ openbao_backup_namespace }}"
+        state: absent
+        delete_options:
+          propagationPolicy: Foreground
+      loop: [save, restore]
+      failed_when: false
+
+    - name: "openbao | teardown | Report what is being preserved"
+      ansible.builtin.debug:
+        msg: >-
+          Preserving {{ _openbao_data_pvcs | length }} OpenBao data PVC(s), the CA
+          (Secret '{{ openbao_tls_ca_secret_name }}' and its Issuers), namespace
+          '{{ openbao_namespace }}' and the snapshot namespace '{{ openbao_backup_namespace }}'
+          (PVC {{ openbao_snapshot_pvc }}, if a backup ran). The PVCs retain all stored secrets
+          (still sealed by the original unseal keys). To delete them as well, re-run with
+          -e openbao_teardown_delete_data=true.
+      when: not (openbao_teardown_delete_data | bool)
+
+    - name: "openbao | teardown | Delete data (explicitly requested)"
+      when: openbao_teardown_delete_data | bool
+      block:
+        - name: "openbao | teardown | Read bound PersistentVolumes"
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: PersistentVolume
+            name: "{{ item }}"
+          loop: "{{ _openbao_data_pvcs | map(attribute='spec.volumeName', default='') | select | list }}"
+          register: _openbao_pvs
+
+        - name: "openbao | teardown | Warn — stored secrets will be deleted"
+          vars:
+            _pvs: "{{ _openbao_pvs.results | default([]) | map(attribute='resources') | flatten }}"
+            _retained: "{{ _pvs | selectattr('spec.persistentVolumeReclaimPolicy', 'eq', 'Retain') | map(attribute='metadata.name') | list }}"
+          ansible.builtin.debug:
+            msg:
+              - >-
+                openbao_teardown_delete_data=true — deleting {{ _openbao_data_pvcs | length }}
+                data PVC(s), the CA, namespace '{{ openbao_namespace }}' and the snapshot
+                namespace '{{ openbao_backup_namespace }}' (the latest Raft snapshot).
+              - >-
+                Bound PVs: {{ _pvs | map(attribute='metadata.name') | zip(_pvs | map(attribute='spec.persistentVolumeReclaimPolicy'))
+                | map('join', '=') | join(', ') or 'none' }}.
+              - >-
+                {% if _retained | length > 0 %}PVs with reclaimPolicy Retain ({{ _retained | join(', ') }})
+                keep the Raft data (sealed secrets) on the volume after the PVC is gone; delete
+                them and their backing storage to destroy it.
+                {% else %}All bound PVs use reclaimPolicy Delete: the stored secrets are destroyed.{% endif %}
+
+        - name: "openbao | teardown | Delete data PVCs"
+          kubernetes.core.k8s:
+            api_version: v1
+            kind: PersistentVolumeClaim
+            name: "{{ item }}"
+            namespace: "{{ openbao_namespace }}"
+            state: absent
+            wait: true
+            wait_timeout: 300
+          loop: "{{ _openbao_data_pvcs | map(attribute='metadata.name') | list }}"
+
+        - name: "openbao | teardown | Delete CA Certificate, Issuers and CA Secret"
+          kubernetes.core.k8s:
+            api_version: "{{ item.api_version }}"
+            kind: "{{ item.kind }}"
+            name: "{{ item.name }}"
+            namespace: "{{ openbao_namespace }}"
+            state: absent
+          loop:
+            - {api_version: cert-manager.io/v1, kind: Certificate, name: "{{ openbao_tls_ca_cert_name }}"}
+            - {api_version: cert-manager.io/v1, kind: Issuer, name: "{{ openbao_tls_ca_issuer_name }}"}
+            - {api_version: cert-manager.io/v1, kind: Issuer, name: "{{ openbao_tls_bootstrap_issuer_name }}"}
+            - {api_version: v1, kind: Secret, name: "{{ openbao_tls_ca_secret_name }}"}
+          loop_control:
+            label: "{{ item.kind }}/{{ item.name }}"
+          failed_when: false
+
+        - name: "openbao | teardown | Delete namespace"
+          kubernetes.core.k8s:
+            api_version: v1
+            kind: Namespace
+            name: "{{ openbao_namespace }}"
+            state: absent
+            wait: true
+            wait_timeout: 300
+
+        # The latest Raft snapshot (sealed by the same keys): data as well.
+        - name: "openbao | teardown | Delete the snapshot namespace"
+          kubernetes.core.k8s:
+            api_version: v1
+            kind: Namespace
+            name: "{{ openbao_backup_namespace }}"
+            state: absent
+            wait: true
+            wait_timeout: 300
+          when: openbao_backup_namespace != openbao_namespace
+
+        - name: "openbao | teardown | Check data PVCs are gone"
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: PersistentVolumeClaim
+            namespace: "{{ openbao_namespace }}"
+          register: _openbao_pvcs_after
+
+        - name: "openbao | teardown | Check namespace is gone"
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Namespace
+            name: "{{ openbao_namespace }}"
+          register: _openbao_ns_after
+
+        - name: "openbao | teardown | Check the snapshot namespace is gone"
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Namespace
+            name: "{{ openbao_backup_namespace }}"
+          register: _openbao_backup_ns_after
+
+        - name: "openbao | teardown | Assert data PVCs and namespace are deleted"
+          vars:
+            _left: >-
+              {{ _openbao_pvcs_after.resources | default([]) | map(attribute='metadata.name')
+                 | select('in', _openbao_data_pvcs | map(attribute='metadata.name') | list) | list }}
+          ansible.builtin.assert:
+            that:
+              - _left | length == 0
+              - _openbao_ns_after.resources | default([]) | length == 0
+              - _openbao_backup_ns_after.resources | default([]) | length == 0
+            fail_msg: >-
+              openbao_teardown_delete_data=true but deletion did not finish:
+              PVCs left {{ _left }}, namespace present={{ _openbao_ns_after.resources | default([]) | length > 0 }},
+              snapshot namespace present={{ _openbao_backup_ns_after.resources | default([]) | length > 0 }}.
+            quiet: true

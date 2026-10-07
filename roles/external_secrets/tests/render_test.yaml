@@ -1,0 +1,390 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# external_secrets — offline render test (no cluster access).
+#
+# Pulls the pinned chart once into a temp dir and renders it with the role's
+# values (`helm template`): ServiceAccount name, CRD keep annotation, no
+# cluster-wide serviceaccounts/token grant, platform affinity and a restricted
+# pod security context on every Deployment. Renders the ClusterSecretStores
+# for internal, external and two-layer configs and validates them strictly
+# against the chart's ClusterSecretStore CRD schema (files/crd_validate.py).
+# Then the preflight failures, the local-mode gate and the task wiring of
+# install/validate/upgrade/teardown. Everything it writes goes to a temp dir
+# that is removed at the end (Helm cache/config/data homes included).
+#
+# Run from the repo root:
+#   ansible-playbook -i localhost, -c local roles/external_secrets/tests/render_test.yaml
+
+- name: "external_secrets | render test"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role_dir: "{{ playbook_dir | dirname }}"
+    _repo_dir: "{{ playbook_dir | dirname | dirname | dirname }}"
+    _helm_env:
+      HELM_CACHE_HOME: "{{ _tmp.path }}/helm/cache"
+      HELM_CONFIG_HOME: "{{ _tmp.path }}/helm/config"
+      HELM_DATA_HOME: "{{ _tmp.path }}/helm/data"
+    # Inputs normally supplied by global_config.yaml / other roles.
+    secrets_backend: openbao
+    openbao_mode: internal
+    env_name: test
+    openbao_kv_mount: intel-ai
+    openbao_auth_audience: vault
+    enforce_pss: true
+    _platform_affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: workload-class
+                  operator: In
+                  values: [platform]
+    _store_cases:
+      - name: internal
+        vars: {}
+        expect: {server: "https://openbao-active.openbao.svc:8200", auth_mount: kubernetes, stores: [erag]}
+      - name: external
+        vars: {openbao_mode: external, openbao_address: "https://bao.example.com:8200/", openbao_auth_mount: k8s/c1, openbao_cluster_id: c1}
+        expect: {server: "https://bao.example.com:8200", auth_mount: k8s/c1, stores: [erag]}
+      - name: two-layers
+        vars: {openbao_layers: [erag, inference]}
+        expect: {server: "https://openbao-active.openbao.svc:8200", auth_mount: kubernetes, stores: [erag, inference]}
+    _preflight_cases:
+      - name: "secrets_backend local"
+        vars: {secrets_backend: local}
+        expect: "only used with secrets_backend: openbao"
+      - name: "bad openbao_mode"
+        vars: {openbao_mode: remote}
+        expect: "openbao_mode must be 'internal' or 'external'"
+      - name: "external: empty address"
+        vars: {openbao_mode: external, openbao_cluster_id: c1}
+        expect: "openbao_address is empty"
+      - name: "external: http:// address"
+        vars: {openbao_mode: external, openbao_cluster_id: c1, openbao_address: "http://bao.example.com:8200"}
+        expect: "must be an https:// URL"
+      - name: "external: address with a path"
+        vars: {openbao_mode: external, openbao_cluster_id: c1, openbao_address: "https://bao.example.com/v1"}
+        expect: "must be an https:// URL"
+      - name: "bad auth mount"
+        vars: {openbao_auth_mount: "k8s//c1"}
+        expect: "openbao_auth_mount \\(k8s//c1\\)"
+      - name: "bad kv mount"
+        vars: {openbao_kv_mount: "a/b"}
+        expect: "openbao_kv_mount \\(a/b\\)"
+      - name: "cluster id equals kv mount"
+        vars: {openbao_cluster_id: intel-ai}
+        expect: "must differ from openbao_kv_mount"
+      - name: "bad cluster id"
+        vars: {openbao_cluster_id: "a b"}
+        expect: "the cluster id \\(a b"
+      - name: "empty layers"
+        vars: {openbao_layers: []}
+        expect: "openbao_layers \\(\\[\\]\\) must be a non-empty list"
+      - name: "layer with upper case"
+        vars: {openbao_layers: [Erag]}
+        expect: "lower-kebab"
+      - name: "duplicate layers"
+        vars: {openbao_layers: [erag, erag]}
+        expect: "distinct"
+      - name: "layer too long for the annotation key"
+        vars: {openbao_layers: ["{{ 'a' * 58 }}"]}
+        expect: "at most 57 characters"
+      - name: "layers as a string"
+        vars: {openbao_layers: "erag"}
+        expect: "must be a non-empty list"
+    # store_assert.yaml with fabricated k8s_info results (store_wait.yaml loop).
+    _ready_valid: {type: Ready, status: "True", reason: Valid, message: store validated}
+    _store_assert_cases:
+      - name: "all valid"
+        stores: [{name: openbao-erag, conds: ["{{ _ready_valid }}"]}, {name: openbao-inference, conds: ["{{ _ready_valid }}"]}]
+        expect: ""
+      - name: "login failed"
+        stores:
+          - {name: openbao-erag, conds: ["{{ _ready_valid }}"]}
+          - name: openbao-inference
+            conds: [{type: Ready, status: "False", reason: InvalidProviderConfig, message: "unable to validate store"}]
+        expect: "openbao-inference: InvalidProviderConfig - unable to validate store"
+      - name: "validation unknown is not valid"
+        stores: [{name: openbao-erag, conds: [{type: Ready, status: "True", reason: ValidationUnknown, message: unknown}]}]
+        expect: "openbao-erag: ValidationUnknown"
+      - name: "no status yet"
+        stores: [{name: openbao-erag, conds: []}]
+        expect: "openbao-erag: no Ready condition yet"
+      - name: "store missing"
+        stores: [{name: openbao-erag, missing: true}]
+        expect: "openbao-erag: not found"
+    # teardown_check.yaml with fabricated k8s_info results.
+    _es_default: {metadata: {name: a, namespace: n1}, spec: {secretStoreRef: {kind: ClusterSecretStore, name: openbao-erag}}}
+    _es_source:
+      metadata: {name: b, namespace: n2}
+      spec:
+        secretStoreRef: {kind: ClusterSecretStore, name: aws}
+        data: [{secretKey: k, remoteRef: {key: x}, sourceRef: {storeRef: {kind: ClusterSecretStore, name: openbao-erag}}}]
+    _es_other: {metadata: {name: c, namespace: n3}, spec: {secretStoreRef: {name: openbao-erag}}}
+    _teardown_cases:
+      - name: "keep CRDs, OpenBao ExternalSecrets left"
+        delete_crds: false
+        es: ["{{ _es_default }}", "{{ _es_source }}", "{{ _es_other }}"]
+        expect_fail: ""
+        expect_openbao_es: [n1/a, n2/b]
+      - name: "re-run: stores already gone, OpenBao ExternalSecrets still found by prefix"
+        delete_crds: false
+        no_managed_stores: true
+        es: ["{{ _es_default }}", "{{ _es_other }}"]
+        expect_fail: ""
+        expect_openbao_es: [n1/a]
+      - name: "delete CRDs, objects left (installer stores do not count)"
+        delete_crds: true
+        es: ["{{ _es_other }}"]
+        push: [{metadata: {name: p, namespace: n4}}]
+        expect_fail: "2 ESO object\\(s\\) still exist \\(ExternalSecret n3/c, PushSecret n4/p\\)"
+        expect_openbao_es: []
+      - name: "delete CRDs, a user store and a generator left"
+        delete_crds: true
+        es: []
+        user_stores: [{metadata: {name: vault-other}}]
+        generators: [{metadata: {name: pw, namespace: n5}}]
+        expect_fail: "2 ESO object\\(s\\) still exist \\(ClusterSecretStore vault-other, Password n5/pw\\)"
+        expect_openbao_es: []
+      - name: "delete CRDs, nothing left"
+        delete_crds: true
+        es: []
+        expect_fail: ""
+        expect_openbao_es: []
+  tasks:
+    - name: "external_secrets | test | Create temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: eso-render-
+      register: _tmp
+
+    - name: "external_secrets | test | Run"
+      block:
+        # Role defaults are not visible to the play's own tasks.
+        - name: "external_secrets | test | Load role defaults"
+          ansible.builtin.include_vars:
+            file: "{{ _role_dir }}/defaults/main.yaml"
+
+        - name: "external_secrets | test | Pull chart once"
+          ansible.builtin.command:
+            argv: [helm, pull, external-secrets, --repo, "{{ external_secrets_chart_repo_url }}",
+                   --version, "{{ external_secrets_chart_version }}", --untar, --untardir, "{{ _tmp.path }}"]
+          environment: "{{ _helm_env }}"
+          changed_when: false
+
+        - name: "external_secrets | test | Render chart values"
+          ansible.builtin.template:
+            src: "{{ _role_dir }}/templates/values.yaml.j2"
+            dest: "{{ _tmp.path }}/values.yaml"
+            mode: "0600"
+
+        - name: "external_secrets | test | helm template"
+          ansible.builtin.command:
+            argv: [helm, template, "{{ external_secrets_helm_release_name }}", "{{ _tmp.path }}/external-secrets",
+                   --namespace, "{{ external_secrets_namespace }}", --values, "{{ _tmp.path }}/values.yaml"]
+          environment: "{{ _helm_env }}"
+          register: _chart
+          changed_when: false
+
+        - name: "external_secrets | test | Save the rendered chart"
+          ansible.builtin.copy:
+            content: "{{ _chart.stdout }}"
+            dest: "{{ _tmp.path }}/chart.yaml"
+            mode: "0600"
+
+        - name: "external_secrets | test | Assert the rendered chart"
+          vars:
+            _docs: "{{ _chart.stdout | from_yaml_all | select | list }}"
+            _deploys: "{{ _docs | selectattr('kind', 'eq', 'Deployment') | list }}"
+            _crds: "{{ _docs | selectattr('kind', 'eq', 'CustomResourceDefinition') | list }}"
+            _crroles: "{{ _docs | selectattr('kind', 'eq', 'ClusterRole') | list }}"
+            _containers: "{{ _deploys | map(attribute='spec.template.spec.containers') | flatten }}"
+            _controller: "{{ _deploys | selectattr('metadata.name', 'eq', external_secrets_helm_release_name) | first }}"
+            _crd_keep: >-
+              {{ _crds | map(attribute='metadata.annotations') | map('dict2items') | map('selectattr', 'key', 'eq', 'helm.sh/resource-policy')
+                 | map('map', attribute='value') | map('list') | list }}
+          ansible.builtin.assert:
+            that:
+              - _deploys | map(attribute='metadata.name') | sort
+                == [external_secrets_helm_release_name, external_secrets_helm_release_name ~ '-cert-controller', external_secrets_helm_release_name ~ '-webhook'] | sort
+              - _controller.spec.template.spec.serviceAccountName == external_secrets_service_account_name
+              - _docs | selectattr('kind', 'eq', 'ServiceAccount') | selectattr('metadata.name', 'eq', external_secrets_service_account_name) | list | length == 1
+              - _crds | length > 0
+              - _crd_keep | unique | list == [['keep']]
+              - _crds | map(attribute='spec.group') | select('eq', 'external-secrets.io') | list | length > 0
+              # No cluster-wide token minting.
+              - _crroles | map(attribute='rules') | flatten | selectattr('resources', 'defined')
+                | selectattr('resources', 'contains', 'serviceaccounts/token') | list | length == 0
+              - _deploys | map(attribute='spec.template.spec.affinity') | unique | list == [_platform_affinity]
+              # PSS restricted (namespace label in install.yaml).
+              - _containers | map(attribute='securityContext.runAsNonRoot') | unique | list == [true]
+              - _containers | map(attribute='securityContext.allowPrivilegeEscalation') | unique | list == [false]
+              - _containers | map(attribute='securityContext.capabilities.drop') | unique | list == [['ALL']]
+              - _containers | map(attribute='securityContext.seccompProfile.type') | unique | list == ['RuntimeDefault']
+              - _containers | map(attribute='image') | select('search', ':v' ~ external_secrets_chart_version ~ '$') | list | length == (_containers | length)
+              - _deploys | map(attribute='spec.template.spec.volumes', default=[]) | flatten | selectattr('hostPath', 'defined') | list | length == 0
+            fail_msg: "Rendered external-secrets chart does not match the role's expectations."
+            quiet: true
+
+        # teardown discovers kinds/versions from the CRDs; check the expression
+        # against the pinned chart's CRDs.
+        - name: "external_secrets | test | Served ESO kinds from the chart's CRDs"
+          vars:
+            _eso_td_crds:
+              resources: "{{ _chart.stdout | from_yaml_all | select | selectattr('kind', 'eq', 'CustomResourceDefinition') | list }}"
+            _kinds: "{{ _eso_served_kinds | items2dict(key_name='kind', value_name='api_version') }}"
+          ansible.builtin.assert:
+            that:
+              - _kinds.ExternalSecret == 'external-secrets.io/v1'
+              - _kinds.ClusterExternalSecret == 'external-secrets.io/v1'
+              - _kinds.ClusterSecretStore == 'external-secrets.io/v1'
+              - _kinds.SecretStore == 'external-secrets.io/v1'
+              - _kinds.PushSecret == 'external-secrets.io/v1alpha1'
+              - _kinds.ClusterPushSecret == 'external-secrets.io/v1alpha1'
+              - _kinds.Password is match('^generators.external-secrets.io/')
+              - _kinds | length == (_eso_td_crds.resources | length)
+            fail_msg: "Served kinds: {{ _kinds }}"
+            quiet: true
+
+        - name: "external_secrets | test | Stale-store pruning picks only removed layers"
+          vars:
+            _eso_stores: [{name: openbao-erag, layer: erag}]
+            _eso_managed_stores:
+              resources: [{metadata: {name: openbao-erag}}, {metadata: {name: openbao-old}}]
+          ansible.builtin.assert:
+            that:
+              - _eso_stale_stores == ['openbao-old']
+            quiet: true
+
+        - name: "external_secrets | test | Store cases"
+          ansible.builtin.include_tasks: _store_case.yaml
+          loop: "{{ _store_cases }}"
+          loop_control:
+            loop_var: _case
+            label: "{{ _case.name }}"
+
+        - name: "external_secrets | test | Token Role is limited to the controller's own ServiceAccount"
+          vars:
+            _docs: "{{ lookup('ansible.builtin.template', _role_dir ~ '/templates/token-rbac.yaml.j2') | from_yaml_all | list }}"
+            _role: "{{ _docs | selectattr('kind', 'eq', 'Role') | first }}"
+            _rb: "{{ _docs | selectattr('kind', 'eq', 'RoleBinding') | first }}"
+            _want_rules:
+              - {apiGroups: [""], resources: [serviceaccounts/token], resourceNames: [external-secrets], verbs: [create]}
+            _want_subjects:
+              - {kind: ServiceAccount, name: external-secrets, namespace: external-secrets}
+          ansible.builtin.assert:
+            that:
+              - _role.rules == _want_rules
+              - _role.metadata.namespace == 'external-secrets'
+              - _rb.subjects == _want_subjects
+              - _rb.roleRef.name == _role.metadata.name
+            quiet: true
+
+        - name: "external_secrets | test | Preflight failure cases"
+          ansible.builtin.include_tasks: _preflight_case.yaml
+          loop: "{{ _preflight_cases }}"
+          loop_control:
+            loop_var: _case
+            label: "{{ _case.name }}"
+
+        # The component gate: with secrets_backend: local the platform never
+        # selects external_secrets (or openbao).
+        - name: "external_secrets | test | Load components.yaml"
+          ansible.builtin.include_vars:
+            file: "{{ _repo_dir }}/configs/components.yaml"
+            name: _components_cfg
+
+        - name: "external_secrets | test | Assert the local-mode gate"
+          vars:
+            secrets_backend: local
+            _entries: "{{ _components_cfg.components | selectattr('name', 'in', ['openbao', 'external_secrets']) | list }}"
+          ansible.builtin.assert:
+            that:
+              - _entries | length == 2
+              - _entries | map(attribute='enabled') | map('bool') | unique | list == [false]
+              - (_entries | selectattr('name', 'eq', 'external_secrets') | first).depends_on == ['openbao']
+            quiet: true
+
+        - name: "external_secrets | test | Assert the openbao-mode gate"
+          vars:
+            _entries: "{{ _components_cfg.components | selectattr('name', 'in', ['openbao', 'external_secrets']) | list }}"
+          ansible.builtin.assert:
+            that:
+              - _entries | map(attribute='enabled') | map('bool') | unique | list == [true]
+            quiet: true
+
+        - name: "external_secrets | test | Load task files"
+          ansible.builtin.set_fact:
+            _t_install: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/install.yaml') | from_yaml }}"
+            _t_validate: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/validate.yaml') | from_yaml }}"
+            _t_upgrade: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/upgrade.yaml') | from_yaml }}"
+            _t_teardown: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/teardown.yaml') | from_yaml }}"
+            _t_wait: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/store_wait.yaml') | from_yaml }}"
+            _t_td_check: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/teardown_check.yaml') | from_yaml }}"
+
+        - name: "external_secrets | test | Assert the task wiring"
+          vars:
+            _names_td: "{{ _t_teardown | map(attribute='name') | list }}"
+            _names_in: "{{ _t_install | map(attribute='name') | list }}"
+            _idx_td: >-
+              {% set r = {} %}{% for t in _t_teardown %}{% for k, pat in {'guard': 'Check leftovers', 'policy': 'Delete the admission policy',
+              'stores': 'Delete the OpenBao ClusterSecretStores', 'uninstall': 'Uninstall the Helm release', 'crds': 'Delete the ESO CRDs',
+              'ns': 'Delete namespace'}.items() %}{% if pat in t.name %}{% set _ = r.update({k: _names_td.index(t.name)}) %}{% endif %}{% endfor %}{% endfor %}{{ r }}
+            _guard: "{{ _t_td_check | selectattr('name', 'search', 'Refuse to delete the CRDs') | first }}"
+            _crd_block: "{{ _t_teardown | selectattr('name', 'search', 'Delete the ESO CRDs') | first }}"
+            _wait_task: "{{ _t_wait | first }}"
+            _inc_install: >-
+              {% set r = [] %}{% for t in _t_install if 'ansible.builtin.include_tasks' in t %}{% set _ = r.append(t['ansible.builtin.include_tasks']) %}{% endfor %}{{ r }}
+            _inc_validate: >-
+              {% set r = [] %}{% for t in _t_validate if 'ansible.builtin.include_tasks' in t %}{% set _ = r.append(t['ansible.builtin.include_tasks']) %}{% endfor %}{{ r }}
+          ansible.builtin.assert:
+            that:
+              - (_t_install | first)['ansible.builtin.include_tasks'] == 'preflight.yaml'
+              - (_t_validate | first)['ansible.builtin.include_tasks'] == 'preflight.yaml'
+              - _t_upgrade | length == 1
+              - _t_upgrade[0]['ansible.builtin.include_tasks'] == 'install.yaml'
+              - _inc_install == ['preflight.yaml', 'store_wait.yaml']
+              - _inc_validate == ['preflight.yaml', 'store_wait.yaml']
+              # The CRD guard runs before anything is removed, only when CRDs are to be deleted.
+              - _idx_td.guard < _idx_td.stores < _idx_td.policy < _idx_td.uninstall < _idx_td.crds < _idx_td.ns
+              - _guard.when == 'external_secrets_teardown_delete_crds | bool'
+              - _crd_block.when == 'external_secrets_teardown_delete_crds | bool'
+              # Install: the path policy is applied before any store.
+              - _names_in.index(_names_in | select('search', 'Pin ExternalSecrets') | first)
+                < _names_in.index(_names_in | select('search', 'Apply ClusterSecretStores') | first)
+              - external_secrets_teardown_delete_crds == false
+              # The store wait can report the condition (failed_when false, then an assert).
+              - _wait_task.failed_when == false
+              - "'until' in _wait_task"
+            quiet: true
+
+        - name: "external_secrets | test | Store status report cases"
+          ansible.builtin.include_tasks: _store_assert_case.yaml
+          loop: "{{ _store_assert_cases }}"
+          loop_control:
+            loop_var: _case
+            label: "{{ _case.name }}"
+
+        - name: "external_secrets | test | Teardown leftover cases"
+          ansible.builtin.include_tasks: _teardown_case.yaml
+          loop: "{{ _teardown_cases }}"
+          loop_control:
+            loop_var: _case
+            label: "{{ _case.name }}"
+
+        - name: "external_secrets | test | Summary"
+          ansible.builtin.debug:
+            msg: >-
+              chart {{ external_secrets_chart_version }} rendered and checked; {{ _store_cases | length }} store
+              cases valid against the CRD schema; {{ _preflight_cases | length }} preflight failures; gates and
+              task wiring checked.
+      always:
+        - name: "external_secrets | test | Remove temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent

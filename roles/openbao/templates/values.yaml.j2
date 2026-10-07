@@ -1,0 +1,218 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao/openbao {{ openbao_chart_version }} values (openbao_mode: internal).
+# Rendered by tasks/install.yaml and by tests/render_test.yaml.
+#
+# Result: Raft-backed OpenBao with listener TLS from the role's cert-manager CA
+# and a file audit device to stdout, started uninitialized and sealed
+# (tasks/init.yaml then initializes, unseals and bootstraps it).
+# No injector, CSI, snapshotAgent or UI; ingress restricted by NetworkPolicy.
+{% set _tls = openbao_tls_mount_dir %}
+{% set _ns_label = 'kubernetes.io/metadata.name' %}
+{# API clients: OpenBao itself (operator), the snapshot Job's namespace, ESO, and
+   every layer's worker namespace (the same <layer>:<namespace>:<sa> specs the
+   roles bind to). #}
+{% set _allowed_ns = [openbao_namespace, _openbao_eso_namespace, openbao_backup_namespace] + (_openbao_layer_specs | map('split', ':') | map(attribute=1) | list) %}
+{% if openbao_route_enabled | default(false) | bool %}
+{%   set _ = _allowed_ns.append(gateway_namespace | default('envoy-gateway-system')) %}
+{% endif %}
+{% set _server_labels = {'app.kubernetes.io/name': 'openbao', 'app.kubernetes.io/instance': openbao_helm_release_name, 'component': 'server'} %}
+{% set _affinity = _platform_affinity | default({}) %}
+{% if (openbao_replicas | int) > 1 %}
+{%   set _affinity = _affinity | combine({'podAntiAffinity': {'requiredDuringSchedulingIgnoredDuringExecution': [
+       {'labelSelector': {'matchLabels': {'app.kubernetes.io/name': 'openbao', 'app.kubernetes.io/instance': openbao_helm_release_name}},
+        'topologyKey': 'kubernetes.io/hostname'}]}}) %}
+{% endif %}
+fullnameOverride: {{ openbao_fullname | to_json }}
+
+global:
+  tlsDisable: false
+
+injector:
+  enabled: false
+
+csi:
+  enabled: false
+
+snapshotAgent:
+  enabled: false
+
+ui:
+  enabled: false
+
+server:
+  # Pinned (the chart's appVersion), so the tls-reloader sidecar and the
+  # snapshot Job run the same image.
+  image:
+    registry: {{ openbao_image_registry | to_json }}
+    repository: {{ openbao_image_repository | to_json }}
+    tag: {{ openbao_image_tag | to_json }}
+
+  # OnDelete (the chart default, pinned here): Helm's wait does not wait for
+  # StatefulSet pods to be Ready, which sealed pods never are. install.yaml
+  # waits for Running instead. Upgrades roll pods one by one (unseal per pod).
+  updateStrategyType: "OnDelete"
+  # Parallel, not the chart's OrderedReady: with OrderedReady pod N+1 is created
+  # only once pod N is Ready, and a sealed pod is never Ready.
+  podManagementPolicy: "Parallel"
+
+  # Platform placement plus, with more than one replica, one Raft voter per
+  # node (the chart's own anti-affinity is replaced by this value).
+  affinity: {{ _affinity | to_json }}
+
+  # PSS restricted: non-root, RuntimeDefault seccomp, no privilege escalation,
+  # all capabilities dropped. SKIP_SETCAP (chart) keeps the entrypoint from
+  # needing IPC_LOCK.
+  statefulSet:
+    securityContext:
+      pod:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      container:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+
+  # Mounted at {{ _tls }}/ (tls.crt, tls.key, ca.crt).
+  # The bootstrap script (tasks/init.yaml runs it in pod 0) is mounted at
+  # /openbao/userconfig/{{ openbao_bootstrap_configmap }}/bootstrap.sh, read-only, no subPath.
+  extraVolumes:
+    - type: secret
+      name: {{ openbao_tls_server_secret_name | to_json }}
+    - type: configMap
+      name: {{ openbao_bootstrap_configmap | to_json }}
+
+  # The in-pod bao CLI talks to https://127.0.0.1:8200 (chart BAO_ADDR); trust
+  # the role CA for it (127.0.0.1 is a SAN of the server cert).
+  extraEnvironmentVars:
+    BAO_CACERT: "{{ _tls }}/ca.crt"
+{% if openbao_tls_reloader_enabled | bool %}
+
+  # OpenBao reads its listener certificate only at start and on SIGHUP. The
+  # sidecar (files/tls-reload.sh watch) sends SIGHUP to the bao server process
+  # once cert-manager renewed the mounted certificate. Signalling it needs the
+  # shared process namespace; the sidecar has no ports and no API rights, runs
+  # the server image as the same non-root user and reads only public files.
+  shareProcessNamespace: true
+  extraContainers:
+    - name: tls-reloader
+      image: {{ openbao_image | to_json }}
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", {{ openbao_tls_reload_script_path | to_json }}, "watch"]
+      env:
+        - name: OB_TLS_DIR
+          value: {{ _tls | to_json }}
+        - name: OB_TLS_ADDR
+          value: "https://127.0.0.1:8200"
+        - name: OB_TLS_INTERVAL
+          value: {{ openbao_tls_reloader_interval | string | to_json }}
+        - name: HOME
+          value: "/tmp"
+      resources: {{ openbao_tls_reloader_resources | to_json }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: {{ ('userconfig-' ~ openbao_tls_server_secret_name) | to_json }}
+          mountPath: {{ _tls | to_json }}
+          readOnly: true
+        - name: {{ ('userconfig-' ~ openbao_bootstrap_configmap) | to_json }}
+          mountPath: {{ ('/openbao/userconfig/' ~ openbao_bootstrap_configmap) | to_json }}
+          readOnly: true
+        - name: tls-reloader-tmp
+          mountPath: /tmp
+  volumes:
+    - name: tls-reloader-tmp
+      emptyDir:
+        sizeLimit: 1Mi
+{% endif %}
+
+  dataStorage:
+    enabled: true
+    size: {{ openbao_storage_size | to_json }}
+    storageClass: {{ ((openbao_storage_class | default('', true)) or none) | to_json }}
+
+  auditStorage:
+    enabled: false
+
+  standalone:
+    enabled: false
+
+  ha:
+    enabled: true
+    replicas: {{ openbao_replicas | int }}
+    raft:
+      enabled: true
+      setNodeId: true
+      config: |
+        ui = false
+
+        listener "tcp" {
+          address         = "[::]:8200"
+          cluster_address = "[::]:8201"
+          tls_cert_file   = "{{ _tls }}/tls.crt"
+          tls_key_file    = "{{ _tls }}/tls.key"
+
+          # Keep the legacy unauthenticated sys/generate-root/* endpoints: with
+          # the root token revoked after bootstrap they are the only way to mint
+          # a temporary root token from the unseal shares (generate-root runbook).
+          # Reachable only through the NetworkPolicy below.
+          disable_unauthed_generate_root_endpoints = false
+        }
+
+        storage "raft" {
+          path = "/openbao/data"
+{% for i in range(openbao_replicas | int) %}
+
+          retry_join {
+            leader_api_addr     = "https://{{ openbao_fullname }}-{{ i }}.{{ openbao_fullname }}-internal:8200"
+            leader_ca_cert_file = "{{ _tls }}/ca.crt"
+          }
+{% endfor %}
+        }
+
+        service_registration "kubernetes" {}
+
+        # AD-18: every request and response to stdout (collected by Loki).
+        # Declared here because OpenBao 2.7 refuses audit devices created
+        # through the API (bao audit enable); bootstrap.sh checks it is active.
+        audit "file" {{ openbao_audit_path | to_json }} {
+          options {
+            file_path = "stdout"
+          }
+        }
+
+  # API (8200): OpenBao itself, the snapshot Job (openbao_backup_namespace), ESO, every layer's secrets
+  # worker Jobs and - with openbao_route_enabled - the gateway. Raft cluster port
+  # (8201): only the OpenBao server pods.
+  networkPolicy:
+    enabled: true
+    ingress:
+      - from:
+{% for ns in _allowed_ns | unique %}
+          - namespaceSelector:
+              matchLabels:
+                {{ _ns_label }}: {{ ns | to_json }}
+{% endfor %}
+        ports:
+          - port: 8200
+            protocol: TCP
+      - from:
+          - podSelector:
+              matchLabels: {{ _server_labels | to_json }}
+        ports:
+          - port: 8201
+            protocol: TCP

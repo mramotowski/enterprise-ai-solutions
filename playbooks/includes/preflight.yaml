@@ -156,6 +156,33 @@
       Must be one of: seaweedfs (default), rustfs or external.
     quiet: true
 
+# ── Secrets backend ───────────────────────────────────────────────────────────
+# Env copies of global_config.yaml seeded before the backend existed lack the
+# keys, hence the default('local'); empty/null also means local.
+
+- name: "Preflight - Secrets backend: validate backend value"
+  ansible.builtin.assert:
+    that:
+      - (secrets_backend | default('local', true)) in ['local', 'openbao']
+    fail_msg: >-
+      Invalid secrets_backend='{{ secrets_backend | default('local', true) }}'.
+      Must be one of: local (default), openbao.
+    quiet: true
+
+# secure_logs is derived in site.yaml, but extra-vars (global_config.yaml,
+# config.<layer>.yaml, -e) override play vars, so a forced false is caught here.
+- name: "Preflight - Secrets backend: require secure_logs with openbao"
+  ansible.builtin.assert:
+    that:
+      - secure_logs | default(false) | bool
+    fail_msg: >-
+      secrets_backend=openbao requires secure_logs=true, but secure_logs is forced to
+      '{{ secure_logs | default('<unset>') }}' (by -e on the command line, global_config.yaml
+      or a config.<layer>.yaml). Remove that secure_logs setting so it is derived from
+      secrets_backend, or set secrets_backend: local.
+    quiet: true
+  when: (secrets_backend | default('local')) == 'openbao'
+
 # ── CPU Policy Resolution ─────────────────────────────────────────────────────
 # Derive every CPU-pinning variable from the single `kubernetes_cpu_policy`
 # switch, so the operator never has to keep nri_cpu_balloons_enabled and the

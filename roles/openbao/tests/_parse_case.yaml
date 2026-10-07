@@ -1,0 +1,24 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One bootstrap_parse.yaml case of render_test.yaml
+# (_case: {name, stdout, state, has_shares, raw_unparsed}).
+
+- name: "openbao | test | parse {{ _case.name }} | Run bootstrap_parse.yaml"
+  ansible.builtin.include_role:
+    name: "{{ _role_dir }}"
+    tasks_from: bootstrap_parse.yaml
+  vars:
+    _openbao_bootstrap_mode: "{{ _case.mode | default('init') }}"
+    _openbao_bootstrap: {stdout: "{{ _case.stdout }}", rc: 0, stderr_lines: ["some stderr"], msg: ""}
+
+- name: "openbao | test | parse {{ _case.name }} | Assert"
+  ansible.builtin.assert:
+    that:
+      - _openbao_bs.state == _case.state
+      - "'shares' not in _openbao_bs"
+      - (_openbao_bs_has_shares | bool) == _case.has_shares
+      - (_openbao_bs_raw_unparsed | bool) == _case.raw_unparsed
+    fail_msg: "{{ _case.name }}: {{ _openbao_bs }} has_shares={{ _openbao_bs_has_shares }} raw={{ _openbao_bs_raw_unparsed }}"
+    quiet: true

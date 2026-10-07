@@ -1,0 +1,23 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — before an upgrade changes anything: the running OpenBao must be
+# initialized, unsealed on every pod and bootstrapped (state 'ok'). A rolling
+# restart of a cluster that is already degraded could lose the quorum.
+#
+# bootstrap.sh status runs in pod 0 against the pods that exist now
+# (_openbao_current_replicas from replicas_guard.yaml), not the new replica count:
+# include params override the preflight fact _openbao_peer_addrs. After a
+# confirmed scale-down, the pods already removed from Raft are not probed.
+
+- name: "openbao | upgrade | Read the state of the running OpenBao"
+  ansible.builtin.include_tasks: bootstrap_exec.yaml
+  vars:
+    _openbao_bootstrap_mode: status
+    _openbao_peer_addrs: >-
+      {% set r = [] %}{% for i in range(1, [_openbao_current_replicas | int, openbao_replicas | int] | min) %}{% set _ = r.append('https://'
+      ~ openbao_fullname ~ '-' ~ i ~ '.' ~ openbao_fullname ~ '-internal:8200') %}{% endfor %}{{ r }}
+
+- name: "openbao | upgrade | Fail unless initialized, unsealed and bootstrapped"
+  ansible.builtin.include_tasks: state_fail.yaml

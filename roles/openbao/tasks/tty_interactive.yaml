@@ -1,0 +1,60 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — require a local controller and an interactive, writable terminal on
+# the stdin of ansible-playbook (no change is made here); sets _openbao_tty_dev
+# to that terminal's device. Included by tty_preflight.yaml (before init: the
+# unseal shares are shown on that terminal and the run waits for confirmation)
+# and rollout.yaml (the upgrade pauses until the operator unsealed each pod).
+#
+# Input: _openbao_tty_purpose (why the terminal is needed, for the messages),
+# _openbao_tty_hint (what was or was not changed so far).
+
+# The terminal is the controller's: the play must run locally.
+- name: "openbao | Preflight — runs on the local controller"
+  ansible.builtin.assert:
+    that:
+      - (ansible_connection | default('local')) == 'local'
+    fail_msg: >-
+      {{ _openbao_tty_purpose }}, so the platform play must use connection 'local' (got
+      '{{ ansible_connection | default('') }}' for {{ inventory_hostname }}). {{ _openbao_tty_hint }}
+    quiet: true
+
+# ansible-core workers call setsid() (WorkerProcess._detach), so no task has a
+# controlling terminal and /dev/tty gives ENXIO. Resolve the terminal of the
+# ansible-playbook process instead: the pipe lookup's shell is a child of the
+# worker, whose parent is that process (checked); its fd 0 is the stdin the
+# pause reads.
+# Writing to that device path needs no controlling terminal. Linux /proc only.
+- name: "openbao | Preflight — resolve the controller terminal"
+  ansible.builtin.set_fact:
+    _openbao_tty_dev: >-
+      {{ lookup('ansible.builtin.pipe',
+         'p=$(sed -n "s/^PPid:[[:space:]]*//p" "/proc/$PPID/status" 2>/dev/null); '
+         ~ 'if [ -n "$p" ] && grep -aq ansible-playbook "/proc/$p/cmdline" 2>/dev/null '
+         ~ '&& t=$(readlink "/proc/$p/fd/0" 2>/dev/null); then echo "$t"; else echo none; fi') }}
+
+- name: "openbao | Preflight — the controller terminal is writable"
+  ansible.builtin.shell:
+    cmd: ': > "$OPENBAO_TTY"'
+  environment:
+    OPENBAO_TTY: "{{ _openbao_tty_dev }}"
+  register: _openbao_tty_probe
+  changed_when: false
+  failed_when: false
+  when: _openbao_tty_dev is match('^/dev/(pts/[0-9]+|tty[A-Za-z0-9]*)$')
+
+- name: "openbao | Preflight — needs an interactive terminal"
+  ansible.builtin.assert:
+    that:
+      - _openbao_tty_dev is match('^/dev/(pts/[0-9]+|tty[A-Za-z0-9]*)$')
+      - _openbao_tty_probe.rc | default(1) == 0
+    fail_msg: >-
+      This OpenBao step needs an interactive terminal: {{ _openbao_tty_purpose }}
+      (stdin of ansible-playbook: '{{ _openbao_tty_dev }}', writable:
+      {{ _openbao_tty_probe.rc | default(1) == 0 }}{{ ': ' ~ (_openbao_tty_probe.stderr | trim) if (_openbao_tty_probe.stderr | default('') | trim) else '' }}).
+      Run './es_auto_installer.sh install ...' from an interactive shell on a Linux
+      controller (not CI, not with stdin redirected), as the user who owns that terminal
+      (not after su/sudo -u). {{ _openbao_tty_hint }}
+    quiet: true

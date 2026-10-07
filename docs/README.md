@@ -35,6 +35,7 @@ Install the platform, serve a model, deploy RAG, and go beyond a single node.
 | [Multi-Node & BYO Cluster](deploy/topologies.md) | Deploying across several machines, or onto an existing cluster |
 | [NetApp ONTAP and Trident](deploy/netapp_ontap.md) | Deploying with Trident + ONTAP as the storage backend |
 | [Network Architecture](deploy/networking.md) | Network topology, IP allocation, and how a request reaches a model |
+| [OpenBao Secrets Backend](deploy/openbao.md) | `secrets_backend: openbao` operations: first install (unseal shares), unseal after a restart, upgrades and scaling, certificate renewal, operator login, generate-root, lost shares, external OpenBao, the route, External Secrets Operator, backup and restore, limitations. Settings: [Configuration Reference](customize/configuration.md#secrets-backend) |
 
 ## Configure & customize
 

@@ -1,0 +1,287 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — read-only checks of the operator's OpenBao (openbao_mode: external)
+#
+# Run from the installer host (install, before ESO and the layers; validate).
+# Needs the facts of preflight.yaml. Nothing here writes OpenBao configuration;
+# the only write is revoke-self of the installer's own short-lived token.
+#   1. sys/health: reachable over TLS (openbao_ca_file), initialized, unsealed
+#   2. tokenless login probes on auth/<openbao_auth_mount>/login, one per AD-7
+#      role: "invalid role name" = role missing, "could not load backend
+#      configuration" = auth not configured, 403 "permission denied" = role exists
+#   3. operator login (_openbao_external_login_tasks), then with that token:
+#      sys/internal/ui/mounts/<openbao_kv_mount> is KV v2, sys/audit lists a device
+#   4. auth/token/revoke-self (always)
+# The template that sets all of this up: docs/deploy/openbao.md, "External OpenBao".
+
+- name: "openbao | external | Expected roles"
+  ansible.builtin.set_fact:
+    _openbao_ext_roles: >-
+      {% set r = [] %}{% for spec in _openbao_layer_specs %}{% set l = spec.split(':')[0] %}{%
+      set _ = r.extend(['eso-' ~ l, l ~ '-secrets-worker', l ~ '-secrets-importer']) %}{% endfor %}{{ r + ['operator'] }}
+    _openbao_ext_template_hint: >-
+      Apply roles/openbao/files/external-template.sh (docs/deploy/openbao.md, "External OpenBao") with
+      export CLUSTER_ID={{ _openbao_cluster_id | quote }} KV_MOUNT={{ openbao_kv_mount | quote }}
+      AUTH_MOUNT={{ _openbao_auth_mount | quote }} AUDIENCE={{ openbao_auth_audience | quote }}
+      LAYERS={{ _openbao_layer_specs | join(' ') | quote }} ESO_SA={{ _openbao_eso_sa | quote }}
+      ESO_NAMESPACE={{ _openbao_eso_namespace | quote }} OPERATOR_SA={{ openbao_operator_sa | quote }}
+      OPERATOR_NAMESPACE={{ openbao_operator_namespace | quote }} (plus K8S_HOST, K8S_CA_FILE and
+      REVIEWER_JWT_FILE for this cluster)
+    _openbao_ext_uri:
+      ca_path: "{{ _openbao_ca_file }}"
+      validate_certs: true
+      use_proxy: "{{ openbao_external_use_proxy | bool }}"
+      timeout: "{{ openbao_external_timeout | int }}"
+
+# ── 1. Health ─────────────────────────────────────────────────────────────────
+
+- name: "openbao | external | GET sys/health on {{ _openbao_address }}"
+  ansible.builtin.uri:
+    url: "{{ _openbao_address }}/v1/sys/health?standbyok=true&perfstandbyok=true"
+    method: GET
+    ca_path: "{{ _openbao_ext_uri.ca_path }}"
+    validate_certs: true
+    use_proxy: "{{ _openbao_ext_uri.use_proxy }}"
+    timeout: "{{ _openbao_ext_uri.timeout }}"
+    status_code: [200, 429, 472, 473, 501, 503]
+  register: _openbao_ext_health
+  failed_when: false
+
+- name: "openbao | external | Assert OpenBao is reachable over TLS"
+  ansible.builtin.assert:
+    that:
+      - (_openbao_ext_health.status | default(-1) | int) in [200, 429, 472, 473, 501, 503]
+    fail_msg: >-
+      Cannot reach OpenBao at {{ _openbao_address }} over TLS with the CA in
+      openbao_ca_file ({{ _openbao_ca_file }}): {{ _openbao_ext_health.msg | default('') | truncate(300) }}
+      (HTTP {{ _openbao_ext_health.status | default(-1) }}). Check the address and port, that
+      openbao_ca_file is the CA that signed the server certificate (and the address is one of its
+      names), and the proxy: with http(s)_proxy set, add the OpenBao host to no_proxy or set
+      openbao_external_use_proxy: false.
+    quiet: true
+
+- name: "openbao | external | Assert OpenBao is initialized and unsealed"
+  vars:
+    _h: "{{ _openbao_ext_health.json | default({}) }}"
+    _st: "{{ _openbao_ext_health.status | int }}"
+  ansible.builtin.assert:
+    that:
+      - (_st | int) != 501 and (_h.initialized | default(true) | bool)
+      - (_st | int) != 503 and not (_h.sealed | default(false) | bool)
+      # 472: a DR secondary, which cannot serve logins or KV reads.
+      - (_st | int) != 472
+    fail_msg: >-
+      OpenBao at {{ _openbao_address }} is
+      {{ 'not initialized' if ((_st | int) == 501 or not (_h.initialized | default(true) | bool))
+         else ('a disaster-recovery secondary' if (_st | int) == 472 else 'sealed') }}
+      (sys/health HTTP {{ _st }}). The installer does not initialize or unseal an external
+      OpenBao: {{ 'initialize it and apply the template (docs/deploy/openbao.md, "External OpenBao")'
+      if ((_st | int) == 501 or not (_h.initialized | default(true) | bool))
+      else ('point openbao_address at the primary cluster' if (_st | int) == 472 else 'unseal it with your unseal keys') }},
+      then re-run.
+    quiet: true
+
+# ── 2. Tokenless login probes ─────────────────────────────────────────────────
+
+# A role name nothing creates: "invalid role name" proves the auth mount exists.
+- name: "openbao | external | Probe auth/{{ _openbao_auth_mount }}"
+  ansible.builtin.uri:
+    url: "{{ _openbao_address }}/v1/auth/{{ _openbao_auth_mount }}/login"
+    method: POST
+    body_format: json
+    body: {role: "installer-marker-probe", jwt: "probe"}
+    ca_path: "{{ _openbao_ext_uri.ca_path }}"
+    validate_certs: true
+    use_proxy: "{{ _openbao_ext_uri.use_proxy }}"
+    timeout: "{{ _openbao_ext_uri.timeout }}"
+    status_code: [400, 403, 404, 405]
+  register: _openbao_ext_auth_probe
+  failed_when: false
+
+- name: "openbao | external | Assert auth/{{ _openbao_auth_mount }} exists"
+  vars:
+    _err: "{{ (_openbao_ext_auth_probe.json | default({})).errors | default([]) | join('; ') }}"
+  ansible.builtin.assert:
+    that:
+      - _err is search('invalid role name')
+    fail_msg: >-
+      Kubernetes auth is not enabled at auth/{{ _openbao_auth_mount }} on {{ _openbao_address }}
+      (login probe: HTTP {{ _openbao_ext_auth_probe.status | default(-1) }} {{ _err | truncate(200) }}).
+      Set openbao_auth_mount to the mount you created, or: {{ _openbao_ext_template_hint }}.
+    quiet: true
+
+- name: "openbao | external | Probe the AD-7 roles"
+  ansible.builtin.uri:
+    url: "{{ _openbao_address }}/v1/auth/{{ _openbao_auth_mount }}/login"
+    method: POST
+    body_format: json
+    body: {role: "{{ item }}", jwt: "probe"}
+    ca_path: "{{ _openbao_ext_uri.ca_path }}"
+    validate_certs: true
+    use_proxy: "{{ _openbao_ext_uri.use_proxy }}"
+    timeout: "{{ _openbao_ext_uri.timeout }}"
+    status_code: [400, 403, 500]
+  loop: "{{ _openbao_ext_roles }}"
+  register: _openbao_ext_role_probes
+  failed_when: false
+
+- name: "openbao | external | Classify the role probes"
+  vars:
+    _errs: >-
+      {% set r = {} %}{% for p in _openbao_ext_role_probes.results %}{%
+      set _ = r.update({p.item: ((p.json | default({})).errors | default([p.msg | default('')])) | join('; ')}) %}{% endfor %}{{ r }}
+  ansible.builtin.set_fact:
+    _openbao_ext_missing_roles: "{{ _errs | dict2items | selectattr('value', 'search', 'invalid role name') | map(attribute='key') | list }}"
+    _openbao_ext_auth_unconfigured: "{{ _errs.values() | select('search', 'could not load backend configuration') | list | length > 0 }}"
+    _openbao_ext_unexpected: >-
+      {{ _errs | dict2items | rejectattr('value', 'search', 'invalid role name|permission denied|could not load backend configuration')
+         | map('to_json') | list }}
+
+- name: "openbao | external | Assert auth/{{ _openbao_auth_mount }} is configured"
+  ansible.builtin.assert:
+    that:
+      - not (_openbao_ext_auth_unconfigured | bool)
+    fail_msg: >-
+      auth/{{ _openbao_auth_mount }} on {{ _openbao_address }} has no configuration
+      ("could not load backend configuration"): write auth/{{ _openbao_auth_mount }}/config with this
+      cluster's kubernetes_host, kubernetes_ca_cert and token_reviewer_jwt. {{ _openbao_ext_template_hint }}.
+    quiet: true
+
+- name: "openbao | external | Assert every AD-7 role exists"
+  ansible.builtin.assert:
+    that:
+      - _openbao_ext_missing_roles | length == 0
+      - _openbao_ext_unexpected | length == 0
+    fail_msg: >-
+      {% if _openbao_ext_missing_roles | length > 0 %}Missing Kubernetes-auth role(s) on
+      auth/{{ _openbao_auth_mount }} at {{ _openbao_address }}: {{ _openbao_ext_missing_roles | join(', ') }}.
+      {{ _openbao_ext_template_hint }} (it creates every role for openbao_layers
+      {{ openbao_layers | join(', ') }}).{% endif %}
+      {% if _openbao_ext_unexpected | length > 0 %}Unexpected answers to the role login probes:
+      {{ _openbao_ext_unexpected | join(', ') | truncate(400) }}.{% endif %}
+    quiet: true
+
+# ── 3. Operator login, mount and audit; 4. revoke ─────────────────────────────
+
+- name: "openbao | external | Checks with the operator token"
+  block:
+    - name: "openbao | external | Operator login"
+      ansible.builtin.include_tasks: "{{ _openbao_external_login_tasks }}"
+
+    - name: "openbao | external | GET sys/internal/ui/mounts/{{ openbao_kv_mount }}"
+      ansible.builtin.uri:
+        url: "{{ _openbao_address }}/v1/sys/internal/ui/mounts/{{ openbao_kv_mount }}"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ _openbao_ext_token }}"
+        ca_path: "{{ _openbao_ext_uri.ca_path }}"
+        validate_certs: true
+        use_proxy: "{{ _openbao_ext_uri.use_proxy }}"
+        timeout: "{{ _openbao_ext_uri.timeout }}"
+        status_code: [200, 400, 403, 404]
+      register: _openbao_ext_mount
+      failed_when: false
+      no_log: true
+
+    - name: "openbao | external | GET sys/audit"
+      ansible.builtin.uri:
+        url: "{{ _openbao_address }}/v1/sys/audit"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ _openbao_ext_token }}"
+        ca_path: "{{ _openbao_ext_uri.ca_path }}"
+        validate_certs: true
+        use_proxy: "{{ _openbao_ext_uri.use_proxy }}"
+        timeout: "{{ _openbao_ext_uri.timeout }}"
+        status_code: [200, 400, 403, 404]
+      register: _openbao_ext_audit
+      failed_when: false
+      no_log: true
+
+    # Only non-secret summaries leave the no_log results.
+    - name: "openbao | external | Summarize mount and audit"
+      vars:
+        _m: "{{ (_openbao_ext_mount.json | default({})).data | default({}) }}"
+        _a: "{{ (_openbao_ext_audit.json | default({})).data | default({}) }}"
+      ansible.builtin.set_fact:
+        _openbao_ext_mount_status: "{{ _openbao_ext_mount.status | default(-1) }}"
+        _openbao_ext_mount_type: "{{ _m.type | default('') }}"
+        _openbao_ext_mount_version: "{{ ((_m.options | default({}, true)).version | default('1', true)) if _m.type | default('') == 'kv' else '' }}"
+        _openbao_ext_mount_errors: "{{ ((_openbao_ext_mount.json | default({})).errors | default([_openbao_ext_mount.msg | default('')])) | join('; ') | truncate(200) }}"
+        _openbao_ext_audit_status: "{{ _openbao_ext_audit.status | default(-1) }}"
+        _openbao_ext_audit_devices: "{{ (_a.keys() | list) if _a is mapping else [] }}"
+        _openbao_ext_audit_errors: "{{ ((_openbao_ext_audit.json | default({})).errors | default([_openbao_ext_audit.msg | default('')])) | join('; ') | truncate(200) }}"
+        _openbao_ext_mount: {}
+        _openbao_ext_audit: {}
+      no_log: true
+
+    - name: "openbao | external | Assert {{ openbao_kv_mount }} is a KV v2 mount"
+      ansible.builtin.assert:
+        that:
+          - (_openbao_ext_mount_status | int) == 200
+          - _openbao_ext_mount_type == 'kv'
+          - _openbao_ext_mount_version | string == '2'
+        fail_msg: >-
+          {% if (_openbao_ext_mount_status | int) != 200 %}KV mount '{{ openbao_kv_mount }}' is absent on
+          {{ _openbao_address }}, or the operator role cannot see it (HTTP {{ _openbao_ext_mount_status }}:
+          {{ _openbao_ext_mount_errors }}).{% else %}Mount '{{ openbao_kv_mount }}' on {{ _openbao_address }} is
+          type '{{ _openbao_ext_mount_type }}' version '{{ _openbao_ext_mount_version }}', not KV version 2.{% endif %}
+          The layers need a KV v2 mount at openbao_kv_mount ({{ openbao_kv_mount }}) and the operator
+          policy on {{ openbao_kv_mount }}/+/{{ _openbao_cluster_id }}/*. {{ _openbao_ext_template_hint }}.
+        quiet: true
+
+    - name: "openbao | external | Assert an audit device is enabled"
+      ansible.builtin.assert:
+        that:
+          - (_openbao_ext_audit_status | int) == 200
+          - _openbao_ext_audit_devices | length > 0
+        fail_msg: >-
+          {% if (_openbao_ext_audit_status | int) != 200 %}Cannot list the audit devices of {{ _openbao_address }}
+          as role operator (sys/audit HTTP {{ _openbao_ext_audit_status }}: {{ _openbao_ext_audit_errors }}):
+          its policy needs capabilities ["read", "sudo"] on sys/audit.
+          {% else %}No audit device is enabled on {{ _openbao_address }}: audit device required (AD-18).
+          Declare one in the OpenBao server configuration (e.g. audit "file" "file" {options {file_path = "stdout"}}).
+          {% endif %}{{ _openbao_ext_template_hint }}.
+        quiet: true
+
+  always:
+    # The installer's own token only; nothing else is ever written.
+    - name: "openbao | external | Revoke the operator token (revoke-self)"
+      ansible.builtin.uri:
+        url: "{{ _openbao_address }}/v1/auth/token/revoke-self"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ _openbao_ext_token }}"
+        ca_path: "{{ _openbao_ext_uri.ca_path }}"
+        validate_certs: true
+        use_proxy: "{{ _openbao_ext_uri.use_proxy }}"
+        timeout: "{{ _openbao_ext_uri.timeout }}"
+        status_code: [200, 204]
+      register: _openbao_ext_revoke
+      when: _openbao_ext_token | default('') | length > 0
+      failed_when: false
+      no_log: true
+
+    - name: "openbao | external | Forget the operator token"
+      ansible.builtin.set_fact:
+        _openbao_ext_revoke_status: "{{ _openbao_ext_revoke.status | default(-1) }}"
+        _openbao_ext_revoked: "{{ (_openbao_ext_token | default('') | length == 0) or (_openbao_ext_revoke.status | default(-1)) in [200, 204] }}"
+        _openbao_ext_token: ""
+        _openbao_ext_revoke: {}
+      no_log: true
+
+    - name: "openbao | external | Warn if the operator token was not revoked"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: revoke-self of the installer's operator token failed (HTTP {{ _openbao_ext_revoke_status }}).
+          It expires on its own (role operator token_ttl).
+      when: not (_openbao_ext_revoked | bool)
+
+- name: "openbao | external | OpenBao checks passed"
+  ansible.builtin.debug:
+    msg: >-
+      External OpenBao {{ _openbao_address }}: initialized, unsealed; auth/{{ _openbao_auth_mount }} with
+      roles {{ _openbao_ext_roles | join(', ') }}; KV v2 '{{ openbao_kv_mount }}'; audit device(s)
+      {{ _openbao_ext_audit_devices | join(', ') }}. Nothing was written.

@@ -1,0 +1,36 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One bootstrap.sh run in a test container (bootstrap_test.yaml).
+# Input: _run {container, mode, env (optional overrides)}.
+# Output: _bs (result without shares), _bs_rc, _bs_shares (no_log only).
+
+- name: "openbao | bootstrap test | Run bootstrap.sh {{ _run.mode }} in {{ _run.container }}"
+  vars:
+    _env: "{{ _base_env | combine(_run.env | default({})) }}"
+    _env_args: >-
+      {% set r = [] %}{% for k, v in _env.items() %}{% set _ = r.extend(['-e', k ~ '=' ~ v]) %}{% endfor %}{{ r }}
+  ansible.builtin.command:
+    argv: "{{ ['docker', 'exec'] + _env_args + [_run.container, '/bin/sh', _script_path, _run.mode] + _layer_specs }}"
+  register: _bs_raw
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "openbao | bootstrap test | Parse result"
+  vars:
+    _last: "{{ ((_bs_raw.stdout | default('') | trim).splitlines() or ['']) | last }}"
+    _res: "{{ _last | from_json if _last.startswith('{') else {'state': 'no_result'} }}"
+  ansible.builtin.set_fact:
+    _bs: "{{ _res | dict2items | rejectattr('key', 'eq', 'shares') | items2dict }}"
+    _bs_rc: "{{ _bs_raw.rc }}"
+    _bs_shares: "{{ _res.shares | default(none) }}"
+    # The script's stdout is exactly one line; its stderr never holds a secret.
+    _bs_stdout_lines: "{{ _bs_raw.stdout_lines | length }}"
+    _bs_stderr: "{{ _bs_raw.stderr | default('') }}"
+  no_log: true
+
+- name: "openbao | bootstrap test | Result ({{ _run.mode }})"
+  ansible.builtin.debug:
+    msg: "rc={{ _bs_rc }} {{ _bs | to_json }}"

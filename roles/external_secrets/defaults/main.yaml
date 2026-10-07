@@ -1,0 +1,66 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# external_secrets — Defaults
+#
+# Role-internal settings only. The backend switch and eso_* config keys live in
+# global_config.yaml (secrets_backend, eso_refresh_interval, ...).
+
+external_secrets_namespace: "external-secrets"
+external_secrets_helm_release_name: "external-secrets"
+# ESO controller ServiceAccount, bound by the OpenBao role eso-<layer>. Set as
+# the chart's serviceAccount.name, so it never depends on the chart fullname.
+external_secrets_service_account_name: "{{ external_secrets_helm_release_name }}"
+external_secrets_chart_repo_url: "https://charts.external-secrets.io"
+# ESO is upgraded only by bumping this pin (then: upgrade platform).
+external_secrets_chart_version: "2.11.0"
+
+# --- ClusterSecretStores (one per openbao_layers entry) -------------------------
+# Store name: <prefix><layer>, e.g. openbao-erag. Layers reference it by this
+# name; the admission policy treats every ClusterSecretStore with one of these
+# names as an OpenBao store.
+external_secrets_store_prefix: "openbao-"
+# Namespace label that admits a namespace to the layer's store (ESO
+# spec.conditions[].namespaceSelector) and the annotation on the same namespace
+# that lists the KV paths (relative to <cluster_id>/, comma-separated) its
+# ExternalSecrets may read. Both are written by the layer (erag: app_secrets).
+external_secrets_namespace_label_prefix: "secrets.ai-solutions/"
+external_secrets_paths_annotation_suffix: "-paths"
+
+# Labels on the installer's stores; install (stale-store pruning) and teardown
+# find them by these.
+external_secrets_store_labels:
+  app.kubernetes.io/name: external-secrets
+  app.kubernetes.io/component: openbao-store
+  app.kubernetes.io/managed-by: ai-solutions-installer
+
+# --- Admission policy -------------------------------------------------------------
+external_secrets_path_policy_name: "openbao-externalsecret-paths"
+
+# --- Waits ----------------------------------------------------------------------
+external_secrets_store_wait_retries: 30
+external_secrets_store_wait_delay: 5
+
+# --- Teardown -----------------------------------------------------------------
+# The CRDs carry helm.sh/resource-policy: keep, so uninstalling ESO leaves every
+# ExternalSecret and the Secrets it owns in place. true: delete the ESO CRDs too
+# (refused while any ExternalSecret, ClusterExternalSecret or PushSecret exists).
+external_secrets_teardown_delete_crds: false
+
+# --- Internal (lazy expressions, evaluated where used) ------------------------
+_eso_store_selector: >-
+  {% set r = [] %}{% for k, v in external_secrets_store_labels.items() %}{% set _ = r.append(k ~ '=' ~ v) %}{% endfor %}{{ r }}
+# Installer-managed stores (_eso_managed_stores, k8s_info) not in _eso_stores.
+_eso_stale_stores: >-
+  {{ _eso_managed_stores.resources | default([]) | map(attribute='metadata.name')
+     | reject('in', _eso_stores | map(attribute='name') | list) | list }}
+# API groups of the ESO CRDs (chart 2.x).
+_eso_crd_groups: [external-secrets.io, generators.external-secrets.io]
+# [{kind, api_version}] for every ESO CRD in _eso_td_crds (k8s_info), using
+# its storage version when served, else its first served version.
+_eso_served_kinds: >-
+  {% set r = [] %}{% for c in _eso_td_crds.resources | default([]) if c.spec.group in _eso_crd_groups %}{% set served =
+  c.spec.versions | selectattr('served') | list %}{% set v = (served | selectattr('storage') | list + served) | first
+  | default(none) %}{% if v %}{% set _ = r.append({'kind': c.spec.names.kind, 'api_version': c.spec.group ~ '/' ~ v.name})
+  %}{% endif %}{% endfor %}{{ r }}

@@ -1,0 +1,30 @@
+# external-secrets/external-secrets chart values (tasks/install.yaml).
+# Object names (Deployments, Services) = the release name, whatever it is.
+fullnameOverride: {{ external_secrets_helm_release_name | to_json }}
+
+installCRDs: true
+crds:
+  # helm uninstall must never delete the CRDs: that would delete every
+  # ExternalSecret and, through ownerReferences, the Secrets they own.
+  annotations:
+    helm.sh/resource-policy: keep
+
+serviceAccount:
+  create: true
+  # Bound by the OpenBao Kubernetes-auth role eso-<layer>.
+  name: {{ external_secrets_service_account_name | to_json }}
+
+rbac:
+  create: true
+  # No cluster-wide serviceaccounts/token create: the controller may mint
+  # tokens only for its own ServiceAccount (Role in tasks/install.yaml), which
+  # is all the openbao-<layer> stores need.
+  serviceAccountTokenCreate: false
+
+affinity: {{ _platform_affinity | default({}) | to_json }}
+
+webhook:
+  affinity: {{ _platform_affinity | default({}) | to_json }}
+
+certController:
+  affinity: {{ _platform_affinity | default({}) | to_json }}

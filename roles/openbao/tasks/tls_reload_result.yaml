@@ -1,0 +1,48 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — map the tls-reload.sh answers (_openbao_tls_exec, one k8s_exec
+# result per pod) to _openbao_tls_states ({pod: word}) and fail where a pod
+# serves an old certificate (tls_reload.yaml; separate so the render test can
+# drive it with fabricated results).
+#   always fatal      stale, failed, nocert
+#   fatal in check    unreachable, no answer (validate must not pass unchecked)
+#   warning           unavailable (the script is not mounted yet in that pod)
+
+- name: "openbao | TLS reload | Map the answers"
+  ansible.builtin.set_fact:
+    _openbao_tls_states: >-
+      {% set r = {} %}{% for x in _openbao_tls_exec.results | default([]) %}{% set w = ((x.stdout | default('')
+      | trim).splitlines() or ['no answer']) | last | trim %}{% set _ = r.update({x.item: (w if w in
+      ['current', 'stale', 'reloaded', 'unreachable', 'failed', 'unavailable', 'nocert'] else 'no answer')}) %}{% endfor %}{{ r }}
+
+- name: "openbao | TLS reload | Report"
+  ansible.builtin.debug:
+    msg: "Served listener certificate per pod: {{ _openbao_tls_states | dict2items | map(attribute='key') | zip(_openbao_tls_states.values()) | map('join', '=') | join(', ') }}"
+
+- name: "openbao | TLS reload | Pods that cannot be checked yet"
+  vars:
+    _na: "{{ _openbao_tls_states | dict2items | selectattr('value', 'eq', 'unavailable') | map(attribute='key') | list }}"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ _na | join(', ') }} do(es) not have tls-reload.sh mounted yet (the ConfigMap update
+      reaches running pods within about a minute); their served certificate was not checked.
+  when: _na | length > 0
+
+- name: "openbao | TLS reload | Fail on a pod that does not serve the current certificate"
+  vars:
+    _fatal: "{{ ['stale', 'failed', 'nocert'] + (['unreachable', 'no answer'] if _openbao_tls_mode == 'check' else []) }}"
+    _bad: "{{ _openbao_tls_states | dict2items | selectattr('value', 'in', _fatal) | map(attribute='key') | list }}"
+    _why: "{{ _openbao_tls_states | dict2items | selectattr('value', 'in', _fatal) | map(attribute='value') | unique | list }}"
+  ansible.builtin.assert:
+    that:
+      - _bad | length == 0
+    fail_msg: >-
+      OpenBao pod(s) {{ _bad | join(', ') }}: {{ _why | join(', ') }}. 'stale' = it serves a listener
+      certificate other than the current Secret {{ openbao_tls_server_secret_name }} (OpenBao reloads it only
+      on SIGHUP); 'nocert' = the mounted tls.crt holds no certificate; 'unreachable' / 'no answer' = the
+      check could not reach the server. {% if _openbao_tls_mode == 'check' %}Re-run the install, which
+      reloads stale pods, or{% else %}SIGHUP did not help:{% endif %} follow docs/deploy/openbao.md,
+      "Server certificate renewal".
+    quiet: true

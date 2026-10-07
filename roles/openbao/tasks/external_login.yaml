@@ -1,0 +1,84 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — operator-role login to the external OpenBao (external_checks.yaml)
+#
+# Mints a short-lived TokenRequest token for ServiceAccount openbao_operator_sa
+# (audience openbao_auth_audience) and logs in with it as role 'operator' on
+# auth/<openbao_auth_mount>. Sets _openbao_ext_token, which external_checks.yaml
+# revokes (revoke-self) in an always block. The JWT and the token never appear
+# in the output: every task that holds one sets no_log.
+
+- name: "openbao | external | Mint a {{ openbao_external_token_duration }} token for {{ openbao_operator_namespace }}/{{ openbao_operator_sa }}"
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --namespace
+      - "{{ openbao_operator_namespace }}"
+      - create
+      - token
+      - "{{ openbao_operator_sa }}"
+      - --audience
+      - "{{ openbao_auth_audience }}"
+      - --duration
+      - "{{ openbao_external_token_duration }}"
+  register: _openbao_ext_jwt
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "openbao | external | Token request result"
+  ansible.builtin.set_fact:
+    _openbao_ext_jwt_ok: "{{ (_openbao_ext_jwt.rc | default(1)) == 0 and (_openbao_ext_jwt.stdout | default('') | trim | length) > 0 }}"
+    _openbao_ext_jwt_err: "{{ (_openbao_ext_jwt.stderr | default(_openbao_ext_jwt.msg | default('')) | string)[-300:] }}"
+  no_log: true
+
+- name: "openbao | external | Assert the token request succeeded"
+  ansible.builtin.assert:
+    that:
+      - _openbao_ext_jwt_ok | bool
+    fail_msg: >-
+      kubectl create token {{ openbao_operator_sa }} -n {{ openbao_operator_namespace }} failed:
+      {{ _openbao_ext_jwt_err }}
+    quiet: true
+
+- name: "openbao | external | Log in as role operator on auth/{{ _openbao_auth_mount }}"
+  ansible.builtin.uri:
+    url: "{{ _openbao_address }}/v1/auth/{{ _openbao_auth_mount }}/login"
+    method: POST
+    body_format: json
+    body:
+      role: operator
+      jwt: "{{ _openbao_ext_jwt.stdout | trim }}"
+    ca_path: "{{ _openbao_ext_uri.ca_path }}"
+    validate_certs: true
+    use_proxy: "{{ _openbao_ext_uri.use_proxy }}"
+    timeout: "{{ _openbao_ext_uri.timeout }}"
+    status_code: [200]
+  register: _openbao_ext_login
+  failed_when: false
+  no_log: true
+
+- name: "openbao | external | Keep the token, forget the JWT"
+  ansible.builtin.set_fact:
+    _openbao_ext_token: "{{ (_openbao_ext_login.json | default({})).auth.client_token | default('') if (_openbao_ext_login.status | default(-1)) == 200 else '' }}"
+    _openbao_ext_login_status: "{{ _openbao_ext_login.status | default(-1) }}"
+    _openbao_ext_login_errors: "{{ ((_openbao_ext_login.json | default({})).errors | default([_openbao_ext_login.msg | default('')])) | join('; ') | truncate(300) }}"
+    _openbao_ext_jwt: {}
+    _openbao_ext_login: {}
+  no_log: true
+
+- name: "openbao | external | Assert the operator login succeeded"
+  ansible.builtin.assert:
+    that:
+      - _openbao_ext_token | length > 0
+    fail_msg: >-
+      Login as role 'operator' on {{ _openbao_address }}/v1/auth/{{ _openbao_auth_mount }}/login
+      failed (HTTP {{ _openbao_ext_login_status }}: {{ _openbao_ext_login_errors }}). Check that the
+      role binds ServiceAccount {{ openbao_operator_sa }} in namespace {{ openbao_operator_namespace }}
+      with audience '{{ openbao_auth_audience }}', and that OpenBao can call this cluster's
+      TokenReview API (auth/{{ _openbao_auth_mount }}/config: kubernetes_host reachable from OpenBao,
+      kubernetes_ca_cert, and a token_reviewer_jwt whose ServiceAccount is bound to
+      system:auth-delegator). See docs/deploy/openbao.md, "External OpenBao".
+    quiet: true

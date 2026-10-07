@@ -1,0 +1,46 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — make every server pod serve the mounted (current) listener
+# certificate (internal mode).
+#
+#   _openbao_tls_mode: reload-if-stale  (install, upgrade) SIGHUP where stale
+#                      check            (validate) report only
+#
+# files/tls-reload.sh runs in each pod's openbao container (k8s_exec, the script
+# from the bootstrap ConfigMap). It reads only the public certificate files and
+# probes the unauthenticated seal-status endpoint; its output is one word.
+# A pod that does not have the script mounted yet (created before it existed)
+# reports 'unavailable'. tls_reload_result.yaml maps the answers and fails.
+
+- name: "openbao | TLS reload | List server pods"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ openbao_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/name=openbao"
+      - "app.kubernetes.io/instance={{ openbao_helm_release_name }}"
+      - "component=server"
+    field_selectors:
+      - status.phase=Running
+  register: _openbao_tls_pods
+
+- name: "openbao | TLS reload | {{ _openbao_tls_mode }} in each pod"
+  kubernetes.core.k8s_exec:
+    namespace: "{{ openbao_namespace }}"
+    pod: "{{ item }}"
+    container: openbao
+    command: >-
+      /bin/sh -c {{ ('[ -r ' ~ (openbao_tls_reload_script_path | quote) ~ ' ] || { echo unavailable; exit 0; }; '
+      ~ 'OB_TLS_DIR=' ~ (openbao_tls_mount_dir | quote) ~ ' /bin/sh ' ~ (openbao_tls_reload_script_path | quote)
+      ~ ' ' ~ _openbao_tls_mode) | quote }}
+  loop: "{{ _openbao_tls_pods.resources | default([]) | map(attribute='metadata.name') | sort }}"
+  register: _openbao_tls_exec
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "openbao | TLS reload | Results"
+  ansible.builtin.include_tasks: tls_reload_result.yaml

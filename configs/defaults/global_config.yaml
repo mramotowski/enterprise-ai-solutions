@@ -82,6 +82,28 @@ postgresql_databases:
 # defines nodes with an accelerator: field — no separate flag needed.
 rack_scale_enabled: false
 
+# --- Secrets backend ---
+# local   (default) credentials are generated and stored as today; every layer and
+#         every output is unchanged.
+# openbao opt-in: the platform layer adds OpenBao + External Secrets Operator, and
+#         layers listed in openbao_layers keep their credentials in OpenBao. Turns
+#         secure_logs on (masks secret values in installer logs); preflight fails
+#         if secure_logs is forced false while this is set.
+secrets_backend: local                    # local | openbao
+openbao_mode: internal                    # internal (installer deploys OpenBao) | external (bring your own)
+openbao_address: ""                       # external mode: OpenBao URL, e.g. https://openbao.example.com:8200
+openbao_ca_file: ""                       # external mode: PEM on the installer host that signed openbao_address
+openbao_kv_mount: intel-ai                # KV v2 mount; paths are <mount>/<cluster_id>/<layer>/<component>/<credential>
+openbao_cluster_id: ""                    # empty = env name; required in external mode (unique per cluster)
+openbao_replicas: 1                       # internal mode: OpenBao Raft replicas
+openbao_auth_audience: vault              # audience of the SA tokens used for Kubernetes auth
+openbao_auth_mount: kubernetes            # Kubernetes auth mount path; external mode: one per cluster sharing an OpenBao (internal: kubernetes)
+openbao_layers: [erag]                    # layers that get an OpenBao role, policy and ClusterSecretStore
+openbao_route_enabled: false              # internal mode: true = publish openbao.<base_domain_name> on the gateway (path allowlist)
+eso_refresh_interval: 1h                  # how often ESO re-reads OpenBao into k8s Secrets
+erag_secrets_namespace: erag-secrets      # namespace of the erag secrets worker Jobs
+erag_secrets_worker_sa: erag-secrets-worker  # ServiceAccount the erag worker Jobs log in with
+
 # =============================================================================
 # Advanced Options (most users won't need to change these)
 # =============================================================================

@@ -165,6 +165,10 @@ seaweedfs_volume_storage_size: "10Gi"
 # https_proxy: "http://proxy.example.com:8080"
 # no_proxy: "localhost,127.0.0.1,10.233.0.0/18,10.233.64.0/18,.svc,.cluster.local,<node-subnet>"
 
+# --- Secrets backend (see "Secrets backend" below) ---
+secrets_backend: local                    # local | openbao (OpenBao + External Secrets Operator)
+openbao_mode: internal                    # internal | external (bring your own OpenBao)
+
 # --- Component toggles (set false to skip) ---
 # cert_manager_enabled: true
 # metallb_enabled: true
@@ -187,6 +191,7 @@ seaweedfs_volume_storage_size: "10Gi"
 | `gateway_request_timeout` | Max time the gateway waits for a model response before timing out |
 | `object_store_backend` | Backend for log/trace/blob storage |
 | `existing_kubernetes` | Point to an existing kubeconfig to skip cluster provisioning entirely |
+| `secrets_backend` | Where solution layers keep their credentials: generated locally (default) or in OpenBao |
 
 ---
 
@@ -382,6 +387,66 @@ or as install-time overrides:
 
 ---
 
+## Secrets backend
+
+`secrets_backend` decides where solution layers keep the credentials they generate or
+consume. It is one key for the whole env: every layer of the env uses the same backend.
+
+| `secrets_backend` | What happens |
+|---|---|
+| `local` (default) | Nothing changes: layers generate their credentials and store them as they always did (Kubernetes Secrets and, for erag, files under `env/<name>/logs/rag/`). No OpenBao or ESO is installed. |
+| `openbao` | The platform layer adds OpenBao (`openbao`) and External Secrets Operator (`external_secrets`) before the solution layers. Every layer in `openbao_layers` keeps its credentials in OpenBao, and ESO projects them into the Kubernetes Secrets the workloads read. `secure_logs` is turned on (secret values are masked in the installer logs). |
+
+Set the keys in `env/<name>/global_config.yaml` before the first install with the backend
+on. Every key is in the template (`configs/defaults/global_config.yaml`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `secrets_backend` | `local` | `local` or `openbao` |
+| `openbao_mode` | `internal` | `internal`: the installer runs OpenBao in namespace `openbao` (needs `cert_manager_enabled: true`). `external`: you run OpenBao and prepare it with the documented template |
+| `openbao_address` | `""` | external mode: the OpenBao URL, `https://host:port` |
+| `openbao_ca_file` | `""` | external mode: PEM file on the installer host with the CA that signed `openbao_address` (certificate only, no key) |
+| `openbao_kv_mount` | `intel-ai` | the KV v2 mount. Paths are `<mount>/<cluster_id>/<layer>/<component>/<credential>` |
+| `openbao_cluster_id` | `""` | empty = the env name. Required in external mode, unique per cluster, and different from `openbao_kv_mount` |
+| `openbao_replicas` | `1` | internal mode: Raft replicas, `1` or an odd number `>= 3` |
+| `openbao_auth_audience` | `vault` | audience of the ServiceAccount tokens used for Kubernetes auth |
+| `openbao_auth_mount` | `kubernetes` | Kubernetes auth mount. Internal mode: `kubernetes`. External mode: one per cluster when clusters share an OpenBao |
+| `openbao_layers` | `[erag]` | layers that get an OpenBao role, policy and `ClusterSecretStore openbao-<layer>` |
+| `openbao_route_enabled` | `false` | internal mode: publish `https://openbao.<base_domain_name>` on the gateway (path allowlist) |
+| `eso_refresh_interval` | `1h` | how often ESO re-reads OpenBao into the Kubernetes Secrets |
+| `erag_secrets_namespace` | `erag-secrets` | namespace of the erag secrets Jobs (worker, importer, rotator, vector-dims) |
+| `erag_secrets_worker_sa` | `erag-secrets-worker` | ServiceAccount the erag worker Jobs log in with |
+
+Role defaults that are rarely changed (override in `global_config.yaml` or with `-e`):
+`openbao_key_shares` (5) and `openbao_key_threshold` (3) for the Shamir init,
+`openbao_storage_size` (`10Gi`), `openbao_image_tag`, `openbao_chart_version`,
+`openbao_tls_reloader_enabled` (`roles/openbao/defaults/main.yaml`) and
+`external_secrets_chart_version` (`roles/external_secrets/defaults/main.yaml`).
+
+Preflight stops the install, naming the key, when:
+
+- `secrets_backend` is neither `local` nor `openbao`;
+- `secure_logs` is forced to `false` while `secrets_backend: openbao`;
+- internal mode runs with `cert_manager_enabled: false`, or `openbao_replicas` is even;
+- external mode lacks `openbao_address` (or it is not `https://`), `openbao_ca_file` or
+  `openbao_cluster_id`, or sets `openbao_route_enabled: true`;
+- `openbao_kv_mount` and the cluster id are empty, invalid or equal.
+
+The first internal install initializes OpenBao from an interactive terminal and shows the
+unseal shares once. Everything about running it (unseal, upgrades, external mode, the
+route, backup) is in the [OpenBao runbook](../deploy/openbao.md). Where the erag
+credentials are and how to migrate, rotate and tear them down is in the erag guide,
+[Credentials in OpenBao](https://github.com/intel/enterprise-rag/blob/main/docs/deploy/openbao.md).
+
+Switching an existing env from `local` to `openbao` is supported for erag (its install
+migrates the running values). Switching back from `openbao` to `local` is not.
+
+The platform's own credentials (the Keycloak and Grafana admin passwords above, the shared
+PostgreSQL owners, the object store, Velero) stay in platform Kubernetes Secrets with
+either backend.
+
+---
+
 ## BYO cluster
 
 ```yaml
@@ -424,3 +489,4 @@ Example: `config.erag.yaml` sets RAG pipeline parameters like `ui_enabled`, `edp
 | Configure per-node CPU pinning (`kubernetes_cpu_policy: nri-balloons`) in depth | [NRI CPU Balloons](nri_cpu_balloons.md) |
 | Set up soft affinity for platform vs. inference workloads (`node_topology_enabled`) | [Node Topology & Workload Placement](node_topology.md) |
 | Go from a fresh clone to a running cluster using these settings | [Deployment Guide](../deploy/install_platform.md) |
+| Run OpenBao (`secrets_backend: openbao`): unseal, upgrades, external mode, backup | [OpenBao runbook](../deploy/openbao.md) |

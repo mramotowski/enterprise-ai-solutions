@@ -1,0 +1,28 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — read the snapshot Job's result (snapshot_job.yaml; separate so the
+# render test can drive it). Input: _openbao_snap_job (k8s_info of the Job),
+# _openbao_snap_log (k8s_log). Sets _openbao_snapshot_result (the last JSON line
+# files/snapshot.sh printed, or a 'failed' record), _openbao_snapshot_job_ok
+# (succeeded) and _openbao_snapshot_job_done (succeeded, failed or gone).
+
+- name: "openbao | snapshot | {{ _openbao_snapshot_mode }} | Parse the result"
+  vars:
+    _lines: "{{ _openbao_snap_log.log_lines | default([]) | map('trim') | select | list }}"
+    _json: "{{ _lines | select('match', '^\\{\"result\":') | list }}"
+  ansible.builtin.set_fact:
+    _openbao_snapshot_result: >-
+      {{ (_json | last | from_json) if _json | length > 0 else
+         {'result': 'failed', 'stage': 'job', 'error': 'no result in the Job log: ' ~ ((_lines[-3:] | join(' ')) or (_openbao_snap_log.msg | default('no log'))) | truncate(400),
+          'bytes': 0, 'sha256': '', 'file': '', 'sealed': none} }}
+    _openbao_snapshot_job_ok: >-
+      {{ (_openbao_snap_job.resources | default([]) | length == 1)
+         and ((_openbao_snap_job.resources[0].status.succeeded | default(0) | int) > 0) }}
+    _openbao_snapshot_job_done: >-
+      {{ (_openbao_snap_job.resources | default([]) | length == 0)
+         or (((_openbao_snap_job.resources[0].status.succeeded | default(0) | int) > 0)
+              or ((_openbao_snap_job.resources[0].status.failed | default(0) | int) > 0)
+              or (_openbao_snap_job.resources[0].status.conditions | default([])
+                  | selectattr('type', 'in', ['Failed', 'Complete']) | selectattr('status', 'eq', 'True') | list | length) > 0) }}

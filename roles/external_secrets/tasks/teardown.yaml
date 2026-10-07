@@ -1,0 +1,128 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# external_secrets — Teardown
+#
+# Removes the admission policy, the installer-managed openbao-<layer>
+# ClusterSecretStores (found by label, so it does not depend on the current
+# openbao_layers), the token Role, the Helm release and the namespace. The ESO
+# CRDs carry helm.sh/resource-policy: keep, so ExternalSecrets left by a layer
+# and the Secrets they own stay in place (they are no longer refreshed); the
+# run warns with their count. Layers remove their own ExternalSecrets in their
+# teardown, which runs first.
+# -e external_secrets_teardown_delete_crds=true deletes the ESO CRDs too; it is
+# refused while any ESO object other than the installer's stores exists (in
+# either API group: ExternalSecrets, PushSecrets, user stores, generators, ...;
+# finalizers would hang without the controller, and deleting a CRD deletes its
+# objects and the Secrets they own).
+
+# ESO may never have been installed: a missing CRD is not an error, anything
+# else (RBAC, API) is.
+# Every ESO kind actually served, from the CRDs (no hard-coded versions): a
+# kind whose CRD is missing is skipped, any other listing error fails.
+- name: "external_secrets | teardown | Find the ESO CRDs"
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+  register: _eso_td_crds
+
+- name: "external_secrets | teardown | Served ESO kinds"
+  ansible.builtin.set_fact:
+    _eso_td_kinds: "{{ _eso_served_kinds }}"
+
+- name: "external_secrets | teardown | Find installer-managed ClusterSecretStores"
+  kubernetes.core.k8s_info:
+    api_version: "{{ (_eso_td_kinds | selectattr('kind', 'eq', 'ClusterSecretStore') | first).api_version }}"
+    kind: ClusterSecretStore
+    label_selectors: "{{ _eso_store_selector }}"
+  register: _eso_td_stores
+  when: _eso_td_kinds | selectattr('kind', 'eq', 'ClusterSecretStore') | list | length > 0
+
+- name: "external_secrets | teardown | Find every ESO object"
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+  register: _eso_td_objects
+  loop: "{{ _eso_td_kinds }}"
+  loop_control:
+    label: "{{ item.kind }}"
+
+# Leftover ESO objects: refuse a CRD deletion, warn otherwise.
+- name: "external_secrets | teardown | Check leftovers"
+  ansible.builtin.include_tasks: teardown_check.yaml
+
+# While the controller still runs (it owns the store finalizers), and before
+# the admission policy goes, so no labelled namespace can use an unpinned store.
+- name: "external_secrets | teardown | Delete the OpenBao ClusterSecretStores"
+  kubernetes.core.k8s:
+    api_version: external-secrets.io/v1
+    kind: ClusterSecretStore
+    name: "{{ item }}"
+    state: absent
+    wait: true
+  loop: "{{ _eso_td_stores.resources | default([]) | map(attribute='metadata.name') | list }}"
+
+- name: "external_secrets | teardown | Delete the admission policy"
+  kubernetes.core.k8s:
+    api_version: admissionregistration.k8s.io/v1
+    kind: "{{ item }}"
+    name: "{{ external_secrets_path_policy_name }}"
+    state: absent
+  loop:
+    - ValidatingAdmissionPolicyBinding
+    - ValidatingAdmissionPolicy
+
+- name: "external_secrets | teardown | Check Helm release"
+  kubernetes.core.helm_info:
+    name: "{{ external_secrets_helm_release_name }}"
+    release_namespace: "{{ external_secrets_namespace }}"
+  register: _eso_td_release
+
+- name: "external_secrets | teardown | Uninstall the Helm release"
+  kubernetes.core.helm:
+    name: "{{ external_secrets_helm_release_name }}"
+    release_namespace: "{{ external_secrets_namespace }}"
+    state: absent
+    wait: "{{ helm_wait }}"
+    timeout: "{{ helm_timeout }}"
+  when: _eso_td_release.status is defined
+
+- name: "external_secrets | teardown | Delete the token Role and RoleBinding"
+  kubernetes.core.k8s:
+    api_version: rbac.authorization.k8s.io/v1
+    kind: "{{ item }}"
+    name: "{{ external_secrets_helm_release_name }}-own-token"
+    namespace: "{{ external_secrets_namespace }}"
+    state: absent
+  loop: [RoleBinding, Role]
+
+- name: "external_secrets | teardown | Delete the ESO CRDs"
+  kubernetes.core.k8s:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ _eso_td_crds.resources | default([])
+       | selectattr('spec.group', 'in', _eso_crd_groups)
+       | map(attribute='metadata.name') | list }}
+  when: external_secrets_teardown_delete_crds | bool
+
+- name: "external_secrets | teardown | Delete namespace"
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: "{{ external_secrets_namespace }}"
+    state: absent
+    wait: true
+    wait_timeout: 300
+
+- name: "external_secrets | teardown | Done"
+  ansible.builtin.debug:
+    msg: >-
+      External Secrets Operator removed (release, namespace '{{ external_secrets_namespace }}',
+      ClusterSecretStores {{ _eso_td_stores.resources | default([]) | map(attribute='metadata.name') | join(', ') or 'none' }},
+      admission policy {{ external_secrets_path_policy_name }}).
+      {{ 'ESO CRDs deleted.' if external_secrets_teardown_delete_crds | bool else
+         'ESO CRDs kept (helm.sh/resource-policy: keep); delete them with -e external_secrets_teardown_delete_crds=true once no ExternalSecret is left.' }}

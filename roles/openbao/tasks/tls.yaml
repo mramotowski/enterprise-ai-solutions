@@ -1,0 +1,143 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Listener TLS (internal mode)
+#
+# A CA owned by this role, all namespaced in openbao_namespace (mirrors the
+# envoy_gateway selfsigned chain, with Issuers instead of ClusterIssuers):
+#   selfSigned Issuer -> CA Certificate (Secret openbao-ca) -> CA Issuer ->
+#   server Certificate (Secret openbao-server-tls).
+# Clients (ESO, erag worker Jobs, retry_join) trust openbao-ca.
+
+- name: "openbao | TLS | Create self-signed bootstrap Issuer"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
+      metadata:
+        name: "{{ openbao_tls_bootstrap_issuer_name }}"
+        namespace: "{{ openbao_namespace }}"
+      spec:
+        selfSigned: {}
+  register: _openbao_bootstrap_issuer
+  # The cert-manager webhook may still be starting on a fresh platform install.
+  until: _openbao_bootstrap_issuer is not failed
+  retries: 12
+  delay: 10
+
+- name: "openbao | TLS | Create CA Certificate"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: "{{ openbao_tls_ca_cert_name }}"
+        namespace: "{{ openbao_namespace }}"
+      spec:
+        isCA: true
+        commonName: "{{ openbao_tls_ca_common_name }}"
+        secretName: "{{ openbao_tls_ca_secret_name }}"
+        duration: "{{ openbao_tls_ca_duration }}"
+        renewBefore: "{{ openbao_tls_ca_renew_before }}"
+        privateKey:
+          algorithm: ECDSA
+          size: 256
+        issuerRef:
+          name: "{{ openbao_tls_bootstrap_issuer_name }}"
+          kind: Issuer
+          group: cert-manager.io
+
+- name: "openbao | TLS | Wait for CA Secret"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ openbao_tls_ca_secret_name }}"
+    namespace: "{{ openbao_namespace }}"
+  register: _openbao_ca_secret
+  until:
+    - _openbao_ca_secret.resources | default([]) | length > 0
+    - _openbao_ca_secret.resources[0].data | default({}) | length > 0
+  retries: "{{ openbao_tls_wait_retries }}"
+  delay: "{{ openbao_tls_wait_delay }}"
+  no_log: true
+
+- name: "openbao | TLS | Create CA Issuer"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
+      metadata:
+        name: "{{ openbao_tls_ca_issuer_name }}"
+        namespace: "{{ openbao_namespace }}"
+      spec:
+        ca:
+          secretName: "{{ openbao_tls_ca_secret_name }}"
+
+# SANs: the client Service, the active/standby Services, the headless
+# <fullname>-internal Service and every pod's Raft address
+# (<fullname>-N.<fullname>-internal), each short and namespace-qualified, plus
+# 127.0.0.1 for the in-pod CLI.
+- name: "openbao | TLS | Create server Certificate"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: "{{ openbao_tls_server_cert_name }}"
+        namespace: "{{ openbao_namespace }}"
+      spec:
+        secretName: "{{ openbao_tls_server_secret_name }}"
+        commonName: "{{ openbao_fullname }}.{{ openbao_namespace }}.svc"
+        duration: "{{ openbao_tls_server_duration }}"
+        renewBefore: "{{ openbao_tls_server_renew_before }}"
+        privateKey:
+          algorithm: ECDSA
+          size: 256
+          rotationPolicy: Always
+        usages:
+          - server auth
+          - client auth
+          - digital signature
+        dnsNames: "{{ _openbao_server_dns_names }}"
+        ipAddresses: "{{ _openbao_server_ip_addresses }}"
+        issuerRef:
+          name: "{{ openbao_tls_ca_issuer_name }}"
+          kind: Issuer
+          group: cert-manager.io
+
+- name: "openbao | TLS | Wait for server Certificate to be Ready"
+  kubernetes.core.k8s_info:
+    api_version: cert-manager.io/v1
+    kind: Certificate
+    name: "{{ openbao_tls_server_cert_name }}"
+    namespace: "{{ openbao_namespace }}"
+  register: _openbao_server_cert
+  until:
+    - _openbao_server_cert.resources | default([]) | length > 0
+    # observedGeneration: a Ready condition from before a spec (SAN) change is stale.
+    - _openbao_server_cert.resources[0].status.conditions | default([])
+      | selectattr('type', 'eq', 'Ready') | selectattr('status', 'eq', 'True')
+      | selectattr('observedGeneration', 'defined')
+      | selectattr('observedGeneration', 'eq', _openbao_server_cert.resources[0].metadata.generation)
+      | list | length > 0
+  retries: "{{ openbao_tls_wait_retries }}"
+  delay: "{{ openbao_tls_wait_delay }}"
+
+- name: "openbao | TLS | Wait for server TLS Secret"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ openbao_tls_server_secret_name }}"
+    namespace: "{{ openbao_namespace }}"
+  register: _openbao_server_secret
+  until:
+    - _openbao_server_secret.resources | default([]) | length > 0
+    - (_openbao_server_secret.resources[0].data | default({})).keys() | list is superset(['tls.crt', 'tls.key', 'ca.crt'])
+  retries: "{{ openbao_tls_wait_retries }}"
+  delay: "{{ openbao_tls_wait_delay }}"
+  no_log: true

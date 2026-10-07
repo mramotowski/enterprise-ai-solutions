@@ -1,0 +1,62 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One ClusterSecretStore render case of render_test.yaml
+# (_case: {name, vars, expect: {server, auth_mount, stores}}).
+
+- name: "external_secrets | test | {{ _case.name }} | Preflight"
+  ansible.builtin.include_role:
+    name: "{{ _role_dir }}"
+    tasks_from: preflight.yaml
+  vars:
+    openbao_mode: "{{ _case.vars.openbao_mode | default('internal') }}"
+    openbao_address: "{{ _case.vars.openbao_address | default('') }}"
+    openbao_auth_mount: "{{ _case.vars.openbao_auth_mount | default('kubernetes') }}"
+    openbao_layers: "{{ _case.vars.openbao_layers | default(['erag']) }}"
+    openbao_cluster_id: "{{ _case.vars.openbao_cluster_id | default('') }}"
+
+- name: "external_secrets | test | {{ _case.name }} | Render the stores"
+  ansible.builtin.template:
+    src: "{{ _role_dir }}/templates/cluster-secret-store.yaml.j2"
+    dest: "{{ _tmp.path }}/stores-{{ _case.name }}.yaml"
+    mode: "0600"
+
+- name: "external_secrets | test | {{ _case.name }} | Validate against the chart's CRD schema"
+  ansible.builtin.command:
+    argv: [python3, "{{ playbook_dir }}/files/crd_validate.py", "{{ _tmp.path }}/chart.yaml", "{{ _tmp.path }}/stores-{{ _case.name }}.yaml"]
+  changed_when: false
+
+- name: "external_secrets | test | {{ _case.name }} | Assert the stores"
+  vars:
+    _docs: "{{ lookup('ansible.builtin.file', _tmp.path ~ '/stores-' ~ _case.name ~ '.yaml') | from_yaml_all | select | list }}"
+    _v: "{{ _docs | map(attribute='spec.provider.vault') | list }}"
+    _want_ca: {type: ConfigMap, name: openbao-ca-bundle, namespace: openbao, key: ca.crt}
+    _want_sa: {name: external-secrets, namespace: external-secrets, audiences: [vault]}
+    _selector_ok: >-
+      {% set r = [] %}{% for d in _docs %}{% set ok = namespace(v=true) %}{% for sel in _eso_store_selector %}{% set k, v = sel.split('=', 1)
+      %}{% if (d.metadata.labels | default({})).get(k) != v %}{% set ok.v = false %}{% endif %}{% endfor %}{% set _ = r.append(ok.v) %}{% endfor %}{{ r }}
+    _want_conditions: >-
+      {% set r = [] %}{% for l in _case.expect.stores %}{% set _ = r.append([{'namespaceSelector':
+      {'matchLabels': {'secrets.ai-solutions/' ~ l: 'true'}}}]) %}{% endfor %}{{ r }}
+  ansible.builtin.assert:
+    that:
+      - _docs | map(attribute='kind') | unique | list == ['ClusterSecretStore']
+      - _docs | map(attribute='apiVersion') | unique | list == ['external-secrets.io/v1']
+      - _docs | map(attribute='metadata.name') | list == _case.expect.stores | map('regex_replace', '^', 'openbao-') | list
+      - _v | map(attribute='server') | unique | list == [_case.expect.server]
+      - _v | map(attribute='path') | unique | list == ['intel-ai']
+      - _v | map(attribute='version') | unique | list == ['v2']
+      - _v | map(attribute='caProvider') | unique | list == [_want_ca]
+      - _v | map(attribute='auth.kubernetes.mountPath') | unique | list == [_case.expect.auth_mount]
+      - _v | map(attribute='auth.kubernetes.role') | list == _case.expect.stores | map('regex_replace', '^', 'eso-') | list
+      # Not referent: the namespace is always set.
+      - _v | map(attribute='auth.kubernetes.serviceAccountRef') | unique | list == [_want_sa]
+      - (_docs | map(attribute='spec.conditions') | list) == _want_conditions
+      # install (pruning) and teardown find the stores by this selector.
+      - _eso_store_selector | length >= 2
+      - _selector_ok | unique | list == [true]
+      # No static token, AppRole or other auth method.
+      - _v | map(attribute='auth') | map('dict2items') | map('map', attribute='key') | map('list') | unique | list == [['kubernetes']]
+    fail_msg: "{{ _case.name }}: rendered stores do not match: {{ _docs | to_json }}"
+    quiet: true

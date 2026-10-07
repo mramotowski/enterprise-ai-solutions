@@ -1,0 +1,45 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Preflight for OpenBao init (no change is made here).
+#
+# Init returns the unseal shares once; they are written straight to the
+# terminal device on ansible-playbook's stdin (never to stdout, which
+# es_auto_installer.sh tees into the env log) and the run waits for the
+# operator to confirm. So, before init, require:
+#   - an interactive, writable terminal on that stdin (shares + confirmation pause);
+#   - no ANSIBLE_DEBUG (ES_LOG_LEVEL=trace), which logs module results raw;
+#   - no ANSIBLE_KEEP_REMOTE_FILES, which would keep module payloads on disk.
+# Included by install.yaml (fresh install, before any change) and init.yaml
+# (right before init).
+
+# A local controller and an interactive, writable terminal.
+- name: "openbao | Preflight — interactive terminal for OpenBao init"
+  ansible.builtin.include_tasks: tty_interactive.yaml
+  vars:
+    _openbao_tty_purpose: >-
+      OpenBao init shows the unseal shares on the terminal of the machine running
+      ansible-playbook and waits for you to confirm they are saved
+    _openbao_tty_hint: "Nothing was changed in OpenBao."
+
+- name: "openbao | Preflight — no trace logging during OpenBao init"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'ANSIBLE_DEBUG') | default('', true) | string | lower in ['', '0', 'false', 'no']
+    fail_msg: >-
+      ANSIBLE_DEBUG is set (ES_LOG_LEVEL=trace sets it): Ansible would log the
+      raw OpenBao init result, including the unseal shares. Re-run with
+      ES_LOG_LEVEL=info or debug for the install that initializes OpenBao.
+      Nothing was changed in OpenBao.
+    quiet: true
+
+- name: "openbao | Preflight — no kept module files during OpenBao init"
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'ANSIBLE_KEEP_REMOTE_FILES') | default('', true) | string | lower in ['', '0', 'false', 'no']
+    fail_msg: >-
+      ANSIBLE_KEEP_REMOTE_FILES is set: module payloads (which carry the unseal
+      shares to the terminal) would be left on disk. Unset it for the install that
+      initializes OpenBao. Nothing was changed in OpenBao.
+    quiet: true

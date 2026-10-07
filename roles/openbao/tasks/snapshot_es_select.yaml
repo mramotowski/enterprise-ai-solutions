@@ -1,0 +1,24 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — pick the ExternalSecrets that read an OpenBao store
+# (snapshot_force_sync.yaml; separate so the render test can drive it).
+# Input: _openbao_snap_es (k8s_info), _openbao_snap_eso_defaults. An entry is
+# ours when spec.secretStoreRef, a data[].sourceRef.storeRef or a
+# dataFrom[].sourceRef.storeRef is kind ClusterSecretStore with a name that
+# starts with the store prefix (a namespaced SecretStore of the same name is not).
+# Sets _openbao_snap_es_ours: [{namespace, name}].
+
+- name: "openbao | snapshot | restore | ExternalSecrets on OpenBao stores"
+  vars:
+    _prefix: "{{ external_secrets_store_prefix | default(_openbao_snap_eso_defaults.external_secrets_store_prefix | default('openbao-')) }}"
+  ansible.builtin.set_fact:
+    _openbao_snap_es_ours: >-
+      {% set r = [] %}{% for es in _openbao_snap_es.resources | default([]) %}{%
+      set refs = [es.spec.secretStoreRef | default({})]
+        + (es.spec.data | default([]) | map(attribute='sourceRef', default={}) | map(attribute='storeRef', default={}) | list)
+        + (es.spec.dataFrom | default([]) | map(attribute='sourceRef', default={}) | map(attribute='storeRef', default={}) | list) %}{%
+      if refs | selectattr('kind', 'defined') | selectattr('kind', 'eq', 'ClusterSecretStore')
+         | selectattr('name', 'defined') | map(attribute='name') | select('match', '^' ~ (_prefix | regex_escape)) | list | length > 0 %}{%
+      set _ = r.append({'namespace': es.metadata.namespace, 'name': es.metadata.name}) %}{% endif %}{% endfor %}{{ r }}

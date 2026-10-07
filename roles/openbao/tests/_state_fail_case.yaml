@@ -1,0 +1,32 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One state_fail.yaml case of render_test.yaml (_case: {state, bs, expect}).
+
+- name: "openbao | test | state {{ _case.state }} | Reset"
+  ansible.builtin.set_fact:
+    _sf_failed: false
+    _sf_msg: ""
+
+- name: "openbao | test | state {{ _case.state }} | Run state_fail.yaml"
+  block:
+    - name: "openbao | test | state {{ _case.state }} | Include"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: state_fail.yaml
+      vars:
+        _openbao_bs: "{{ {'state': _case.state, 'error': 'ERRTEXT', 'missing': '', 'sealed_pods': '', 'unreachable_pods': ''} | combine(_case.bs | default({})) }}"
+  rescue:
+    - name: "openbao | test | state {{ _case.state }} | Record"
+      ansible.builtin.set_fact:
+        _sf_failed: true
+        _sf_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "openbao | test | state {{ _case.state }} | Assert message"
+  ansible.builtin.assert:
+    that:
+      - _sf_failed == (_case.expect != '')
+      - _case.expect == '' or _sf_msg is search(_case.expect)
+    fail_msg: "state {{ _case.state }}: failed={{ _sf_failed }} msg={{ _sf_msg }}"
+    quiet: true

@@ -1,0 +1,13 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Test-only stand-in for tasks/external_login.yaml (external_test.yaml points
+# _openbao_external_login_tasks here). No cluster: instead of a TokenRequest and
+# a Kubernetes-auth login, it hands external_checks.yaml the token the test
+# minted with the operator policy (_test_token).
+
+- name: "openbao | external test | Use the test-minted operator token"
+  ansible.builtin.set_fact:
+    _openbao_ext_token: "{{ _test_token }}"
+  no_log: true

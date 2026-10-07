@@ -1,0 +1,46 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One teardown leftover case of render_test.yaml: tasks/teardown_check.yaml
+# with fabricated k8s_info results (_case: {name, delete_crds, es, push,
+# user_stores, generators, no_managed_stores, expect_fail, expect_openbao_es}).
+
+- name: "external_secrets | test | {{ _case.name }} | Reset result"
+  ansible.builtin.set_fact:
+    _td_failed: false
+    _td_msg: ""
+    _eso_td_openbao_es: []
+    _eso_td_stores:
+      resources: "{{ [{'metadata': {'name': 'openbao-erag'}}, {'metadata': {'name': 'openbao-inference'}}] if not _case.no_managed_stores | default(false) else [] }}"
+    _eso_td_objects:
+      results:
+        - {item: {kind: ExternalSecret, api_version: external-secrets.io/v1}, resources: "{{ _case.es }}"}
+        - {item: {kind: ClusterExternalSecret, api_version: external-secrets.io/v1}, resources: []}
+        - {item: {kind: PushSecret, api_version: external-secrets.io/v1alpha1}, resources: "{{ _case.push | default([]) }}"}
+        - item: {kind: ClusterSecretStore, api_version: external-secrets.io/v1}
+          resources: "{{ [{'metadata': {'name': 'openbao-erag'}}, {'metadata': {'name': 'openbao-inference'}}] + (_case.user_stores | default([])) }}"
+        - {item: {kind: Password, api_version: generators.external-secrets.io/v1alpha1}, resources: "{{ _case.generators | default([]) }}"}
+
+- name: "external_secrets | test | {{ _case.name }} | Run teardown_check"
+  block:
+    - name: "external_secrets | test | {{ _case.name }} | Include teardown_check"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: teardown_check.yaml
+      vars:
+        external_secrets_teardown_delete_crds: "{{ _case.delete_crds }}"
+  rescue:
+    - name: "external_secrets | test | {{ _case.name }} | Record failure"
+      ansible.builtin.set_fact:
+        _td_failed: true
+        _td_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "external_secrets | test | {{ _case.name }} | Assert the result"
+  ansible.builtin.assert:
+    that:
+      - (_td_failed | bool) == (_case.expect_fail | length > 0)
+      - _case.expect_fail | length == 0 or _td_msg is search(_case.expect_fail)
+      - _td_failed | bool or _eso_td_openbao_es == _case.expect_openbao_es
+    fail_msg: "{{ _case.name }}: failed={{ _td_failed }} msg={{ _td_msg }} openbao_es={{ _eso_td_openbao_es }}"
+    quiet: true

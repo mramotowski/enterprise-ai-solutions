@@ -1,0 +1,53 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — after a snapshot restore: annotate every ExternalSecret that reads
+# an openbao-<layer> ClusterSecretStore with force-sync, so ESO refreshes its
+# Secret now instead of after eso_refresh_interval. Annotation-only updates
+# pass the external_secrets path policy (it skips UPDATEs that keep spec).
+# Skipped when the ExternalSecret CRD is absent.
+
+- name: "openbao | snapshot | restore | Load the external_secrets defaults (store prefix)"
+  ansible.builtin.include_vars:
+    file: "{{ role_path }}/../external_secrets/defaults/main.yaml"
+    name: _openbao_snap_eso_defaults
+
+- name: "openbao | snapshot | restore | List ExternalSecrets"
+  kubernetes.core.k8s_info:
+    api_version: external-secrets.io/v1
+    kind: ExternalSecret
+  register: _openbao_snap_es
+  failed_when: false
+
+- name: "openbao | snapshot | restore | ExternalSecrets on OpenBao stores"
+  ansible.builtin.include_tasks: snapshot_es_select.yaml
+
+- name: "openbao | snapshot | restore | Annotate force-sync"
+  kubernetes.core.k8s:
+    state: patched
+    api_version: external-secrets.io/v1
+    kind: ExternalSecret
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+    definition:
+      metadata:
+        annotations:
+          force-sync: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+  loop: "{{ _openbao_snap_es_ours }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  register: _openbao_snap_fs
+  failed_when: false
+
+- name: "openbao | snapshot | restore | Report"
+  vars:
+    _failed: "{{ _openbao_snap_fs.results | default([]) | selectattr('failed', 'defined') | selectattr('failed') | map(attribute='item') | list }}"
+  ansible.builtin.debug:
+    msg: >-
+      OpenBao snapshot restored; all pods unsealed. force-sync requested on
+      {{ (_openbao_snap_es_ours | length) - (_failed | length) }} ExternalSecret(s)
+      {%- if _failed | length > 0 %}; failed on {{ _failed | map(attribute='namespace') | zip(_failed | map(attribute='name')) | map('join', '/') | join(', ') }}
+      (they refresh after eso_refresh_interval){% endif %}
+      {%- if _openbao_snap_es.resources is not defined %}; the ExternalSecret API is not served, nothing to refresh{% endif %}.
+      Pods that read a Secret at start only still need their usual restart.

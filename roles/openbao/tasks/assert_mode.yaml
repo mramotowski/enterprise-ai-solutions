@@ -1,0 +1,13 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — shared openbao_mode check (preflight, validate, teardown).
+
+- name: "openbao | Preflight — openbao_mode is internal or external"
+  ansible.builtin.assert:
+    that:
+      - (openbao_mode | default('internal')) in ['internal', 'external']
+    fail_msg: >-
+      openbao_mode must be 'internal' or 'external' (got '{{ openbao_mode | default('') }}').
+    quiet: true

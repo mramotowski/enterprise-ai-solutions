@@ -1,0 +1,45 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — decide whether a backup/restore hook has anything to do, and check
+# its inputs (snapshot_backup.yaml, snapshot_restore.yaml).
+#
+# The hooks run inside a solution's backup playbook (roles/backup, hook kind
+# 'role'), with the env's global_config.yaml in scope. Only internal OpenBao is
+# snapshotted: with secrets_backend: local there is no OpenBao, and an external
+# OpenBao is backed up by whoever runs it. Both are a no-op with a message, so a
+# profile can list the hooks unconditionally.
+# Sets _openbao_snapshot_active.
+
+- name: "openbao | snapshot | Is there an internal OpenBao to snapshot?"
+  ansible.builtin.set_fact:
+    _openbao_snapshot_active: >-
+      {{ (secrets_backend | default('local')) == 'openbao'
+         and (openbao_mode | default('internal')) == 'internal' }}
+
+- name: "openbao | snapshot | Nothing to do"
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'secrets_backend is not openbao: no OpenBao snapshot.'
+         if (secrets_backend | default('local')) != 'openbao'
+         else 'openbao_mode is external: back up your OpenBao yourself (its Raft snapshots and unseal keys); no snapshot is taken here.' }}
+  when: not (_openbao_snapshot_active | bool)
+
+- name: "openbao | snapshot | Inputs"
+  when: _openbao_snapshot_active | bool
+  vars:
+    _label: '^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$'
+  ansible.builtin.assert:
+    that:
+      - openbao_backup_namespace is match(_label)
+      # Never the OpenBao namespace itself: a restore deletes every PVC in the
+      # backup (the live Raft volumes) and replays the chart's objects.
+      - openbao_backup_namespace != openbao_namespace
+      - openbao_snapshot_pvc is match(_label)
+      - openbao_auth_audience | default('') | length > 0
+    fail_msg: >-
+      openbao snapshot hook: openbao_backup_namespace ('{{ openbao_backup_namespace }}') must be a
+      DNS-1123 label other than openbao_namespace ('{{ openbao_namespace }}'), openbao_snapshot_pvc
+      ('{{ openbao_snapshot_pvc }}') a DNS-1123 label, and openbao_auth_audience set.
+    quiet: true

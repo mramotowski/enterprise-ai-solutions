@@ -1,0 +1,25 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — run bootstrap.sh in pod 0 (_openbao_bootstrap_mode: status | init).
+#
+# The script is mounted from the ConfigMap openbao_bootstrap_configmap; the
+# command (defaults _openbao_bootstrap_cmd) passes only non-secret env and args.
+# Registers _openbao_bootstrap (raw; in init mode its stdout carries the unseal
+# shares, so it is only ever used under no_log), then bootstrap_parse.yaml sets
+# _openbao_bs (without the shares) and _openbao_bs_has_shares.
+
+- name: "openbao | {{ _openbao_bootstrap_mode }} | Run bootstrap.sh in pod 0"
+  kubernetes.core.k8s_exec:
+    namespace: "{{ openbao_namespace }}"
+    pod: "{{ openbao_fullname }}-0"
+    container: openbao
+    command: "{{ _openbao_bootstrap_cmd }}"
+  register: _openbao_bootstrap
+  failed_when: false
+  changed_when: false
+  no_log: true
+
+- name: "openbao | {{ _openbao_bootstrap_mode }} | Parse result"
+  ansible.builtin.include_tasks: bootstrap_parse.yaml

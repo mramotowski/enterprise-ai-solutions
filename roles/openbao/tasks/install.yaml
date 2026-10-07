@@ -1,0 +1,22 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Install
+#
+#   internal  install_internal.yaml: the chart (Raft, TLS, NetworkPolicy), then
+#             init/unseal/bootstrap, the CA bundle and the optional route
+#   external  external.yaml: namespace, operator ServiceAccount and CA bundle
+#             only, then read-only checks of the operator's OpenBao (fails
+#             fast, before ESO and the layers); no OpenBao config is written
+
+- name: "openbao | Preflight"
+  ansible.builtin.include_tasks: preflight.yaml
+
+- name: "openbao | Install (external mode)"
+  ansible.builtin.include_tasks: external.yaml
+  when: _openbao_external | bool
+
+- name: "openbao | Install (internal mode)"
+  ansible.builtin.include_tasks: install_internal.yaml
+  when: not (_openbao_external | bool)

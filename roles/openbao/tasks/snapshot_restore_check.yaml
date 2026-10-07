@@ -1,0 +1,32 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — which server pods are not unsealed after a snapshot restore
+# (snapshot_restore.yaml; separate so the render test can drive it).
+# Input: _openbao_snap_pods (k8s_info, all server pods), _openbao_snap_seal
+# (bao status per Running pod), _openbao_snapshot_result, openbao_replicas.
+# Sets _openbao_snap_sealed: pod names that are sealed, gave no status, are not
+# Running, or are missing (openbao-<n> for each expected ordinal); plus the
+# active node itself when the Job saw it sealed or could not tell.
+
+- name: "openbao | snapshot | restore | Pods not unsealed"
+  vars:
+    _expected: "{{ range(openbao_replicas | int) | map('string') | map('regex_replace', '^', openbao_fullname ~ '-') | list }}"
+    _present: "{{ _openbao_snap_pods.resources | default([]) | map(attribute='metadata.name') | list }}"
+    _running: >-
+      {{ _openbao_snap_pods.resources | default([]) | selectattr('status.phase', 'defined')
+         | selectattr('status.phase', 'eq', 'Running') | map(attribute='metadata.name') | list }}
+    _bad_status: >-
+      {% set r = [] %}{% for x in _openbao_snap_seal.results | default([]) %}{% set o = x.stdout | default('') | trim %}{%
+      if not o.startswith('{') or ((o | from_json).sealed | default(true)) %}{% set _ = r.append(x.item) %}{% endif %}{%
+      endfor %}{{ r }}
+    _job_says: >-
+      {{ [] if (_openbao_snapshot_result.sealed | default(none)) is sameas false
+         else ['the active node (snapshot Job: sealed=' ~ (_openbao_snapshot_result.sealed | default(none) | string | lower) ~ ')'] }}
+  ansible.builtin.set_fact:
+    _openbao_snap_sealed: >-
+      {{ (_expected | reject('in', _present) | list)
+         + (_present | reject('in', _running) | list)
+         + _bad_status
+         + (_job_says if (_bad_status | length == 0) else []) }}

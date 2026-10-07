@@ -1,0 +1,495 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — local proof of openbao_mode: external (no cluster access).
+#
+# Two TLS OpenBao 2.7.0 containers with a throwaway CA, initialized here
+# (1 share) with a root token that only this test holds:
+#   A  file audit device declared in the server config
+#   B  no audit device
+# The operator template (roles/openbao/files/external-template.sh, which must equal the
+# block in docs/deploy/openbao.md "External OpenBao") is applied with the root
+# token, then tasks/preflight.yaml + tasks/external_checks.yaml run from this
+# host over TLS, the operator login replaced by a token the test mints with the
+# template's operator policy (_external_login_stub.yaml). Rows:
+#   not initialized  B before init
+#   template         A twice (idempotent); B fails: no audit device
+#   ok               A: passes; the token is revoked afterwards
+#   auth missing     openbao_auth_mount nope: names auth/nope
+#   auth not config. a mount with a role but no config: "has no configuration"
+#   real login       tasks/external_login.yaml with a kubectl shim: TokenRequest
+#                    argv checked; dummy JWT rejected (403); shim failure
+#   role missing     erag-secrets-worker deleted: listed, template pointed to
+#   KV v1            a KV v1 mount as openbao_kv_mount: names mount and version
+#   mount absent     names the mount
+#   no audit device  B: "audit device required (AD-18)"
+#   bad CA           another CA in openbao_ca_file: address, CA file, no_proxy
+#   unreachable      a closed port: address and no_proxy hint
+#   sealed           A sealed: "sealed"
+# Tokens and the unseal key stay in no_log tasks; containers and the temp dir
+# are removed at the end.
+#
+# Run from the repo root:
+#   ansible-playbook -i localhost, -c local roles/openbao/tests/external_test.yaml
+
+- name: "openbao | external test"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role_dir: "{{ playbook_dir | dirname }}"
+    _repo_dir: "{{ playbook_dir | dirname | dirname | dirname }}"
+    _image: "quay.io/openbao/openbao:2.7.0"
+    _test_cid: test-cluster
+    # Inputs normally supplied by global_config.yaml.
+    secrets_backend: openbao
+    env_name: test
+    openbao_layers: [erag]
+    openbao_auth_audience: vault
+    openbao_route_enabled: false
+    erag_secrets_namespace: erag-secrets
+    erag_secrets_worker_sa: erag-secrets-worker
+    _template_env:
+      CLUSTER_ID: "{{ _test_cid }}"
+      KV_MOUNT: intel-ai
+      AUTH_MOUNT: kubernetes
+      K8S_HOST: https://kubernetes.example.invalid:6443
+      K8S_CA_FILE: /certs/k8s-ca.crt
+    _template_cmd: "exec /bin/sh /tmpl/external-template.sh"
+  tasks:
+    # set_fact pins the random suffix (a play var would be re-rolled per use).
+    - name: "openbao | external test | Container name suffix"
+      ansible.builtin.set_fact:
+        _suffix: "{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_lowercase', 'digits'], length=8) }}"
+
+    - name: "openbao | external test | Container names"
+      ansible.builtin.set_fact:
+        _cont_a: "openbao-external-test-{{ _suffix }}-a"
+        _cont_b: "openbao-external-test-{{ _suffix }}-b"
+        _roots: {}
+        _keys: {}
+
+    - name: "openbao | external test | Create temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: openbao-external-
+      register: _tmp
+
+    - name: "openbao | external test | Run"
+      block:
+        # ── Template in the runbook ───────────────────────────────────────
+        - name: "openbao | external test | Assert the template equals the runbook block"
+          vars:
+            _doc: "{{ lookup('ansible.builtin.file', _repo_dir ~ '/docs/deploy/openbao.md') }}"
+            _block: >-
+              {{ (_doc.split('<!-- external-template:begin -->')[1] | default('')).split('<!-- external-template:end -->')[0]
+                 | regex_replace('^\s*```sh\n', '') | regex_replace('\n```\s*$', '') }}
+            _file: "{{ lookup('ansible.builtin.file', _role_dir ~ '/files/external-template.sh') }}"
+          ansible.builtin.assert:
+            that:
+              - _block | trim | length > 0
+              - (_block | trim) == (_file | trim)
+            fail_msg: >-
+              docs/deploy/openbao.md (between the external-template markers) and
+              roles/openbao/files/external-template.sh differ: keep them identical.
+            quiet: true
+
+        # ── Throwaway PKI ─────────────────────────────────────────────────
+        - name: "openbao | external test | Dirs"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}/{{ item }}"
+            state: directory
+            mode: "0755"
+          loop: [certs, cfg-a, cfg-b, shim-ok, shim-fail]
+
+        - name: "openbao | external test | Server cert extensions"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/certs/server.ext"
+            mode: "0644"
+            content: |
+              subjectAltName = IP:127.0.0.1, DNS:localhost
+              extendedKeyUsage = serverAuth
+              keyUsage = digitalSignature, keyEncipherment
+
+        - name: "openbao | external test | CA, other CA, server key and cert"
+          ansible.builtin.command:
+            argv: "{{ item }}"
+            chdir: "{{ _tmp.path }}/certs"
+          loop:
+            - [openssl, req, -x509, -newkey, ec, -pkeyopt, "ec_paramgen_curve:prime256v1", -nodes, -keyout, ca.key,
+               -out, ca.crt, -subj, /CN=external-test-ca, -days, "1"]
+            - [openssl, req, -x509, -newkey, ec, -pkeyopt, "ec_paramgen_curve:prime256v1", -nodes, -keyout, other-ca.key,
+               -out, other-ca.crt, -subj, /CN=external-test-other-ca, -days, "1"]
+            - [openssl, req, -new, -newkey, ec, -pkeyopt, "ec_paramgen_curve:prime256v1", -nodes, -keyout, server.key,
+               -out, server.csr, -subj, /CN=localhost]
+            - [openssl, x509, -req, -in, server.csr, -CA, ca.crt, -CAkey, ca.key, -CAcreateserial, -out, server.crt,
+               -days, "1", -extfile, server.ext]
+            - [cp, other-ca.crt, k8s-ca.crt]
+          loop_control:
+            label: "{{ item[:2] | join(' ') }}"
+          changed_when: true
+
+        # The server runs as uid 100 in the container; this key is throwaway.
+        - name: "openbao | external test | Key and cert modes"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}/certs/{{ item }}"
+            mode: "0644"
+          loop: [server.key, server.crt, ca.crt, other-ca.crt, k8s-ca.crt]
+
+        - name: "openbao | external test | Server configs (A with audit, B without)"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/cfg-{{ item.n }}/server.hcl"
+            mode: "0644"
+            content: |
+              storage "raft" {
+                path    = "/openbao/data"
+                node_id = "external-test-{{ item.n }}"
+              }
+              listener "tcp" {
+                address       = "0.0.0.0:8200"
+                tls_cert_file = "/certs/server.crt"
+                tls_key_file  = "/certs/server.key"
+              }
+              api_addr      = "https://127.0.0.1:8200"
+              cluster_addr  = "https://127.0.0.1:8201"
+              disable_mlock = true
+              {% if item.audit %}
+              audit "file" "file" {
+                options {
+                  file_path = "stdout"
+                }
+              }
+              {% endif %}
+          loop:
+            - {n: a, audit: true}
+            - {n: b, audit: false}
+          loop_control:
+            label: "{{ item.n }}"
+
+        - name: "openbao | external test | Start containers"
+          ansible.builtin.command:
+            argv: [docker, run, -d, --name, "{{ item.name }}", -e, SKIP_SETCAP=true,
+                   -e, "BAO_ADDR=https://127.0.0.1:8200", -e, BAO_CACERT=/certs/ca.crt,
+                   -p, "127.0.0.1::8200",
+                   -v, "{{ _tmp.path }}/cfg-{{ item.n }}:/openbao/config:ro",
+                   -v, "{{ _tmp.path }}/certs:/certs:ro",
+                   -v, "{{ _role_dir }}/files:/tmpl:ro",
+                   "{{ _image }}", server]
+          loop:
+            - {name: "{{ _cont_a }}", n: a}
+            - {name: "{{ _cont_b }}", n: b}
+          loop_control:
+            label: "{{ item.name }}"
+          changed_when: true
+
+        - name: "openbao | external test | Published ports"
+          ansible.builtin.command:
+            argv: [docker, port, "{{ item }}", 8200/tcp]
+          loop: ["{{ _cont_a }}", "{{ _cont_b }}"]
+          register: _port_raw
+          changed_when: false
+
+        - name: "openbao | external test | Keep ports"
+          ansible.builtin.set_fact:
+            _ports: >-
+              {{ dict(_port_raw.results | map(attribute='item')
+                 | zip(_port_raw.results | map(attribute='stdout_lines') | map('first') | map('regex_replace', '^.*:', ''))) }}
+
+        - name: "openbao | external test | Wait for both servers (sealed: rc 2)"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ item }}", bao, status, -format=json]
+          loop: ["{{ _cont_a }}", "{{ _cont_b }}"]
+          register: _up
+          until: _up.rc == 2
+          retries: 30
+          delay: 1
+          changed_when: false
+          failed_when: false
+
+        # ── not initialized ───────────────────────────────────────────────
+        - name: "openbao | external test | Row not initialized"
+          ansible.builtin.include_tasks: _external_case.yaml
+          vars:
+            _row: {name: not initialized, container: "{{ _cont_b }}", vars: {}, expect: "is\\s+not initialized"}
+
+        # ── init + unseal (1 share) ───────────────────────────────────────
+        - name: "openbao | external test | Init"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ item }}", bao, operator, init, -key-shares=1, -key-threshold=1, -format=json]
+          loop: ["{{ _cont_a }}", "{{ _cont_b }}"]
+          register: _init_raw
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | external test | Keep root tokens and keys (no_log)"
+          ansible.builtin.set_fact:
+            _roots: "{{ _roots | combine({item.item: (item.stdout | from_json).root_token}) }}"
+            _keys: "{{ _keys | combine({item.item: (item.stdout | from_json).unseal_keys_b64[0]}) }}"
+          loop: "{{ _init_raw.results }}"
+          no_log: true
+
+        - name: "openbao | external test | Forget the init output"
+          ansible.builtin.set_fact:
+            _init_raw: {}
+          no_log: true
+
+        - name: "openbao | external test | Unseal"
+          ansible.builtin.command:
+            argv: [docker, exec, -i, "{{ item }}", bao, write, sys/unseal, key=-]
+            stdin: "{{ _keys[item] }}"
+          loop: ["{{ _cont_a }}", "{{ _cont_b }}"]
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | external test | Wait for active"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ item }}", bao, status, -format=json]
+          loop: ["{{ _cont_a }}", "{{ _cont_b }}"]
+          register: _act
+          until: _act.rc == 0 and (_act.stdout | from_json).ha_enabled is defined and not (_act.stdout | from_json).sealed
+          retries: 30
+          delay: 1
+          changed_when: false
+
+        - name: "openbao | external test | Wait for the leader"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ item }}", cmd: "for i in $(seq 30); do bao read -format=json sys/leader | tr -d ' \\n' | grep -q '\"is_self\":true' && exit 0; sleep 1; done; exit 1"}
+          loop: ["{{ _cont_a }}", "{{ _cont_b }}"]
+
+        # ── template ──────────────────────────────────────────────────────
+        - name: "openbao | external test | Apply the template to A"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "{{ _template_cmd }}", env: "{{ _template_env }}"}
+
+        - name: "openbao | external test | Assert the template succeeded on A"
+          ansible.builtin.assert:
+            that:
+              - _bao_rc | int == 0
+              - _bao_out is search("set up for cluster 'test-cluster'")
+            fail_msg: "template on A: rc={{ _bao_rc }} {{ _bao_out }} {{ _bao_err }}"
+            quiet: true
+
+        - name: "openbao | external test | Apply the template to A again (idempotent)"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "{{ _template_cmd }}", env: "{{ _template_env }}"}
+
+        - name: "openbao | external test | Assert the re-run succeeded on A"
+          ansible.builtin.assert:
+            that:
+              - _bao_rc | int == 0
+              - _bao_out is search("set up for cluster 'test-cluster'")
+              - _bao_out is not search('Enabled')
+            fail_msg: "template re-run on A: rc={{ _bao_rc }} {{ _bao_out }} {{ _bao_err }}"
+            quiet: true
+
+        - name: "openbao | external test | Template on A with another cluster's API"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "{{ _template_cmd }}", env: "{{ _template_env | combine(_override) }}"}
+            _override: {K8S_HOST: "https://other-cluster.example.invalid:6443"}
+
+        - name: "openbao | external test | Assert the template refused another cluster's API"
+          ansible.builtin.assert:
+            that:
+              - _bao_rc | int != 0
+              - _bao_err is search("auth/kubernetes/config points at https://kubernetes.example.invalid:6443")
+            fail_msg: "rc={{ _bao_rc }} {{ _bao_err }}"
+            quiet: true
+
+        - name: "openbao | external test | Template on A with a bad LAYERS entry"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "{{ _template_cmd }}", env: "{{ _template_env | combine(_override) }}"}
+            _override: {LAYERS: "erag:erag-secrets"}
+
+        - name: "openbao | external test | Assert the template refused a bad LAYERS entry"
+          ansible.builtin.assert:
+            that:
+              - _bao_rc | int != 0
+              - _bao_err is search("bad LAYERS entry 'erag:erag-secrets'")
+            fail_msg: "rc={{ _bao_rc }} {{ _bao_err }}"
+            quiet: true
+
+        - name: "openbao | external test | Apply the template to B (no audit device)"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_b }}", cmd: "{{ _template_cmd }}", env: "{{ _template_env }}"}
+
+        - name: "openbao | external test | Assert the template fails on B for the audit device"
+          ansible.builtin.assert:
+            that:
+              - _bao_rc | int != 0
+              - _bao_err is search('no audit device is enabled')
+            fail_msg: "template on B: rc={{ _bao_rc }} {{ _bao_out }} {{ _bao_err }}"
+            quiet: true
+
+        - name: "openbao | external test | Read back A's operator policy and role"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "bao policy read test-cluster-operator && bao read -format=json auth/kubernetes/role/operator && bao read -format=json auth/kubernetes/config"}
+
+        - name: "openbao | external test | Assert cluster-prefixed policies and sudo on sys/audit"
+          ansible.builtin.assert:
+            that:
+              - _bao_rc | int == 0
+              - _bao_out is search('path "sys/audit" \{\s*capabilities = \["read", "sudo"\]')
+              - _bao_out is search('path "intel-ai/\+/test-cluster/\*"')
+              - _bao_out is search('"token_policies":\s*\[\s*"test-cluster-operator"\s*\]')
+              - _bao_out is search('"disable_local_ca_jwt":\s*true')
+            fail_msg: "{{ _bao_out }} {{ _bao_err }}"
+            quiet: true
+
+        # ── rows ──────────────────────────────────────────────────────────
+        - name: "openbao | external test | Rows"
+          ansible.builtin.include_tasks: _external_case.yaml
+          loop:
+            - {name: ok, container: "{{ _cont_a }}", vars: {}, policies: [test-cluster-operator], expect: ""}
+            - {name: auth missing, container: "{{ _cont_a }}", vars: {openbao_auth_mount: nope}, expect: "not enabled at auth/nope"}
+          loop_control:
+            loop_var: _row
+            label: "{{ _row.name }}"
+
+        # ── auth enabled but not configured ───────────────────────────────
+        - name: "openbao | external test | auth/k8s-noconf with a role and no config"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "bao auth enable -path=k8s-noconf kubernetes && bao write auth/k8s-noconf/role/operator bound_service_account_names=openbao-operator bound_service_account_namespaces=openbao token_policies=test-cluster-operator audience=vault"}
+
+        - name: "openbao | external test | Row auth not configured"
+          ansible.builtin.include_tasks: _external_case.yaml
+          vars:
+            _row: {name: auth not configured, container: "{{ _cont_a }}", vars: {openbao_auth_mount: k8s-noconf},
+                   expect: "auth/k8s-noconf on https://127.0.0.1:[0-9]+ has no configuration"}
+
+        # ── the real external_login.yaml, kubectl replaced by a shim ──────
+        - name: "openbao | external test | kubectl shims (dummy JWT / failure; record argv)"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/shim-{{ item.n }}/kubectl"
+            mode: "0755"
+            content: |
+              #!/bin/sh
+              printf '%s\n' "$@" > "{{ _tmp.path }}/shim-{{ item.n }}/argv"
+              {% if item.fail %}
+              echo "error: shim token request refused" >&2
+              exit 1
+              {% else %}
+              echo "dummy-not-a-jwt"
+              {% endif %}
+          loop:
+            - {n: ok, fail: false}
+            - {n: fail, fail: true}
+          loop_control:
+            label: "{{ item.n }}"
+
+        - name: "openbao | external test | Rows real login"
+          ansible.builtin.include_tasks: _external_case.yaml
+          loop:
+            - {name: real login rejected, container: "{{ _cont_a }}", vars: {}, login_tasks: external_login.yaml,
+               path_prefix: "{{ _tmp.path }}/shim-ok",
+               expect: "Login as role 'operator' on https://127.0.0.1:[0-9]+/v1/auth/kubernetes/login\\s+failed \\(HTTP 403"}
+            - {name: token request fails, container: "{{ _cont_a }}", vars: {}, login_tasks: external_login.yaml,
+               path_prefix: "{{ _tmp.path }}/shim-fail",
+               expect: "kubectl create token openbao-operator -n openbao failed:\\s+error: shim token request refused"}
+          loop_control:
+            loop_var: _row
+            label: "{{ _row.name }}"
+
+        - name: "openbao | external test | Assert the shim got the TokenRequest arguments"
+          ansible.builtin.assert:
+            that:
+              - (lookup('ansible.builtin.file', _tmp.path ~ '/shim-' ~ item ~ '/argv')).splitlines()
+                == ['--namespace', 'openbao', 'create', 'token', 'openbao-operator', '--audience', 'vault', '--duration', '10m']
+            fail_msg: "kubectl argv ({{ item }}): {{ lookup('ansible.builtin.file', _tmp.path ~ '/shim-' ~ item ~ '/argv') }}"
+            quiet: true
+          loop: [ok, fail]
+
+        - name: "openbao | external test | Delete role erag-secrets-worker on A"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "bao delete auth/kubernetes/role/erag-secrets-worker"}
+
+        - name: "openbao | external test | Row role missing"
+          ansible.builtin.include_tasks: _external_case.yaml
+          vars:
+            _row: {name: role missing, container: "{{ _cont_a }}", vars: {},
+                   expect: "Missing Kubernetes-auth role\\(s\\).*: erag-secrets-worker\\..*docs/deploy/openbao.md"}
+
+        - name: "openbao | external test | Re-apply the template on A (restores the role)"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "{{ _template_cmd }}", env: "{{ _template_env }}"}
+
+        - name: "openbao | external test | KV v1 mount and a policy that can see it"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "bao secrets enable -path=kv1 -version=1 kv && printf 'path \"kv1/*\" { capabilities = [\"read\"] }\\n' | bao policy write test-kv1 -"}
+
+        - name: "openbao | external test | Rows (mounts, audit, TLS, reachability)"
+          ansible.builtin.include_tasks: _external_case.yaml
+          loop:
+            - {name: re-applied ok, container: "{{ _cont_a }}", vars: {}, policies: [test-cluster-operator], expect: ""}
+            - {name: KV v1, container: "{{ _cont_a }}", vars: {openbao_kv_mount: kv1}, policies: [test-cluster-operator, test-kv1],
+               expect: "Mount 'kv1' .* is\\s+type 'kv' version '1', not KV version 2"}
+            - {name: mount absent, container: "{{ _cont_a }}", vars: {openbao_kv_mount: nope-kv}, policies: [test-cluster-operator],
+               expect: "KV mount 'nope-kv' is absent"}
+            - {name: no audit device, container: "{{ _cont_b }}", vars: {}, policies: [test-cluster-operator],
+               expect: "audit device required \\(AD-18\\)"}
+            - {name: bad CA, container: "{{ _cont_a }}", vars: {openbao_ca_file: "{{ _tmp.path }}/certs/other-ca.crt"},
+               expect: "Cannot reach OpenBao at https://127.0.0.1:[0-9]+ over TLS.*other-ca.crt.*no_proxy"}
+            - {name: unreachable, container: "{{ _cont_a }}", vars: {openbao_address: "https://127.0.0.1:1"},
+               expect: "Cannot reach OpenBao at https://127.0.0.1:1 .*no_proxy"}
+          loop_control:
+            loop_var: _row
+            label: "{{ _row.name }}"
+
+        # ── sealed ────────────────────────────────────────────────────────
+        - name: "openbao | external test | Seal A"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "bao operator seal"}
+
+        - name: "openbao | external test | Row sealed"
+          ansible.builtin.include_tasks: _external_case.yaml
+          vars:
+            _row: {name: sealed, container: "{{ _cont_a }}", vars: {}, expect: "is\\s+sealed"}
+
+        - name: "openbao | external test | All rows passed"
+          ansible.builtin.debug:
+            msg: >-
+              not initialized, template (A twice, B without audit), ok, auth missing, role missing,
+              KV v1, mount absent, no audit device, bad CA, unreachable and sealed rows passed.
+      always:
+        - name: "openbao | external test | Remove containers"
+          ansible.builtin.command:
+            argv: [docker, rm, -f, -v, "{{ _cont_a }}", "{{ _cont_b }}"]
+          changed_when: true
+          failed_when: false
+
+        - name: "openbao | external test | Remove temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent
+
+        - name: "openbao | external test | Forget tokens and keys"
+          ansible.builtin.set_fact:
+            _roots: {}
+            _keys: {}
+            _test_token: ""
+          no_log: true
+
+    - name: "openbao | external test | List leftover containers"
+      ansible.builtin.command:
+        argv: [docker, ps, -a, --filter, "name=openbao-external-test-{{ _suffix }}", --format, "{{ '{{' }}.Names{{ '}}' }}"]
+      register: _left
+      changed_when: false
+
+    - name: "openbao | external test | Assert no container left"
+      ansible.builtin.assert:
+        that:
+          - _left.stdout | trim | length == 0
+        fail_msg: "Leftover containers: {{ _left.stdout }}"
+        quiet: true

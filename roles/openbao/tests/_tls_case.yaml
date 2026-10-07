@@ -1,0 +1,38 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One tls_reload_result.yaml case of render_test.yaml
+# (_case: {name, mode, out: {pod: stdout}, fail, states}).
+
+- name: "openbao | test | tls {{ _case.name }} | Reset"
+  ansible.builtin.set_fact:
+    _tl_failed: false
+    _tl_msg: ""
+
+- name: "openbao | test | tls {{ _case.name }} | Run tls_reload_result.yaml"
+  block:
+    - name: "openbao | test | tls {{ _case.name }} | Include"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: tls_reload_result.yaml
+        public: true
+      vars:
+        _openbao_tls_mode: "{{ _case.mode }}"
+        _openbao_tls_exec:
+          results: "{{ _tl_results }}"
+        _tl_results: >-
+          {% set r = [] %}{% for k, v in _case.out.items() %}{% set _ = r.append({'item': k, 'stdout': v}) %}{% endfor %}{{ r }}
+  rescue:
+    - name: "openbao | test | tls {{ _case.name }} | Record"
+      ansible.builtin.set_fact:
+        _tl_failed: true
+        _tl_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "openbao | test | tls {{ _case.name }} | Assert"
+  ansible.builtin.assert:
+    that:
+      - _tl_failed == _case.fail
+      - _openbao_tls_states == _case.states
+    fail_msg: "tls {{ _case.name }}: failed={{ _tl_failed }} states={{ _openbao_tls_states | default('?') }} {{ _tl_msg }}"
+    quiet: true

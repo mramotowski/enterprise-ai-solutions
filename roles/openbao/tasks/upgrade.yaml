@@ -1,0 +1,37 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Upgrade (AD-13)
+#
+#   internal  the install with openbao_upgrade: true: before any change, the
+#             running OpenBao must be healthy (upgrade_precheck.yaml) and a
+#             lowered openbao_replicas needs the Raft peers removed
+#             (replicas_guard.yaml); then the chart (openbao_chart_version,
+#             openbao_image_tag) and config are applied and every pod that runs
+#             an old revision is restarted one at a time, standbys first, with a
+#             pause until the operator unsealed it (rollout.yaml).
+#   external  the installer deploys nothing: check the operator's OpenBao
+#             (read-only, as validate does).
+#
+# The installer CLI has no upgrade verb yet; the same path runs with
+#   ./es_auto_installer.sh install openbao --env <env> --only -- -e openbao_upgrade=true
+# Runbook: docs/deploy/openbao.md, "Upgrades".
+
+- name: "openbao | upgrade | openbao_mode"
+  ansible.builtin.include_tasks: assert_mode.yaml
+
+- name: "openbao | upgrade | External mode — check only"
+  when: (openbao_mode | default('internal')) == 'external'
+  block:
+    - name: "openbao | upgrade | Preflight"
+      ansible.builtin.include_tasks: preflight.yaml
+
+    - name: "openbao | upgrade | Check the external OpenBao"
+      ansible.builtin.include_tasks: external_checks.yaml
+
+- name: "openbao | upgrade | Internal mode — rolling upgrade"
+  ansible.builtin.include_tasks: install.yaml
+  vars:
+    openbao_upgrade: true
+  when: (openbao_mode | default('internal')) != 'external'

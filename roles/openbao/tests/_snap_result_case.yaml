@@ -1,0 +1,26 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One snapshot_result.yaml case of render_test.yaml
+# (_case: {name, job_status (null = no Job), lines, result, stage, ok, done}).
+
+- name: "openbao | test | snapshot result {{ _case.name }} | Run"
+  ansible.builtin.include_role:
+    name: "{{ _role_dir }}"
+    tasks_from: snapshot_result.yaml
+    public: true
+  vars:
+    _openbao_snapshot_mode: save
+    _openbao_snap_job: {resources: "{{ [] if _case.job_status is none else [{'status': _case.job_status}] }}"}
+    _openbao_snap_log: {log_lines: "{{ _case.lines }}"}
+
+- name: "openbao | test | snapshot result {{ _case.name }} | Assert"
+  ansible.builtin.assert:
+    that:
+      - _openbao_snapshot_result.result == _case.result
+      - _openbao_snapshot_result.stage == _case.stage
+      - (_openbao_snapshot_job_ok | bool) == _case.ok
+      - (_openbao_snapshot_job_done | bool) == _case.done
+    fail_msg: "snapshot result {{ _case.name }}: {{ _openbao_snapshot_result }} ok={{ _openbao_snapshot_job_ok }} done={{ _openbao_snapshot_job_done }}"
+    quiet: true

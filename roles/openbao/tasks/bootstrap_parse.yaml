@@ -1,0 +1,42 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — parse the bootstrap.sh result in _openbao_bootstrap (stdout, rc,
+# stderr_lines, msg). The script prints one JSON line last; anything else (or
+# nothing) means the exec itself failed, e.g. a lost connection, and gives
+# state 'exec_failed'. Sets _openbao_bs (without shares), _openbao_bs_has_shares
+# and _openbao_bs_raw_unparsed (unparseable but non-empty stdout: in an init run
+# it may hold the shares, so init.yaml shows it on the terminal only).
+
+- name: "openbao | {{ _openbao_bootstrap_mode }} | Parse bootstrap.sh output"
+  vars:
+    _stdout: "{{ _openbao_bootstrap.stdout | default('') | trim }}"
+    _last: "{{ (_stdout.splitlines() or ['']) | last | trim }}"
+    # The exact shape bootstrap.sh emits; only a match goes to from_json, so a
+    # malformed line can never fail this task (and lose the shares).
+    _s: '(?:[^"\\\x00-\x1f]|\\[^\x00-\x1f])*'
+    _shape: >-
+      ^\{"state":"@","stage":"@","error":"@","missing":"@","sealed_pods":"@","unreachable_pods":"@","bootstrap_ok":(true|false),"root_revoked":(true|false),"root_accessor":"@","shares":(null|\[("[A-Za-z0-9+/=]+"(,"[A-Za-z0-9+/=]+")*)?\])\}$
+    _res: "{{ (_last | from_json) if _last is match(_shape | replace('@', _s)) else {} }}"
+  ansible.builtin.set_fact:
+    _openbao_bs: >-
+      {{ (_res | dict2items | rejectattr('key', 'eq', 'shares') | items2dict)
+         if (_res is mapping and 'state' in _res) else
+         {'state': 'exec_failed', 'stage': 'exec',
+          'error': ((_openbao_bootstrap.msg | default('')) ~ ' '
+                    ~ ((_openbao_bootstrap.stderr_lines | default([]))[-3:] | join(' '))) | trim | truncate(400)} }}
+    _openbao_bs_has_shares: >-
+      {{ _res is mapping and (_res.shares | default(none)) is sequence
+         and (_res.shares | default(none)) is not string and (_res.shares | length) > 0 }}
+    _openbao_bs_raw_unparsed: "{{ not (_res is mapping and 'state' in _res) and _stdout | length > 0 }}"
+  no_log: true
+
+- name: "openbao | {{ _openbao_bootstrap_mode }} | Result"
+  ansible.builtin.debug:
+    msg: >-
+      state={{ _openbao_bs.state }} stage={{ _openbao_bs.stage | default('') }}
+      {{ ('missing=' ~ _openbao_bs.missing) if _openbao_bs.missing | default('') else '' }}
+      {{ ('sealed_pods=' ~ _openbao_bs.sealed_pods) if _openbao_bs.sealed_pods | default('') else '' }}
+      {{ ('unreachable_pods=' ~ _openbao_bs.unreachable_pods) if _openbao_bs.unreachable_pods | default('') else '' }}
+      {{ ('error=' ~ _openbao_bs.error) if _openbao_bs.error | default('') else '' }}

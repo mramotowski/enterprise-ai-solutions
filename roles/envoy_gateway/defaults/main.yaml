@@ -64,14 +64,18 @@ gateway_no_auth_routes: []
 # ValidatingAdmissionPolicy: an HTTPRoute claiming one of these hostnames from any
 # other namespace is rejected at admission. Tenants keep full freedom on hostnames
 # they do not own. Extend this list to reserve additional hostnames.
+# With secrets_backend: openbao, openbao.<base_domain_name> is reserved to the
+# OpenBao namespace too (the openbao role publishes it with openbao_route_enabled),
+# so no other namespace can claim it, whether or not the route is on.
 gateway_route_admission_enabled: true
-gateway_protected_hostnames:
-  - hostname: "inference.{{ base_domain_name }}"
-    owner_namespace: "{{ gateway_namespace | default('envoy-gateway-system') }}"
-  - hostname: "keycloak.{{ base_domain_name }}"
-    owner_namespace: "keycloak"
-  - hostname: "grafana.{{ base_domain_name }}"
-    owner_namespace: "monitoring"
+gateway_protected_hostnames: >-
+  {{ [
+       {'hostname': 'inference.' ~ base_domain_name, 'owner_namespace': gateway_namespace | default('envoy-gateway-system')},
+       {'hostname': 'keycloak.' ~ base_domain_name, 'owner_namespace': 'keycloak'},
+       {'hostname': 'grafana.' ~ base_domain_name, 'owner_namespace': 'monitoring'},
+     ]
+     + ([{'hostname': 'openbao.' ~ base_domain_name, 'owner_namespace': openbao_namespace | default('openbao')}]
+        if (secrets_backend | default('local')) == 'openbao' else []) }}
 
 # Keycloak defaults (for SecurityPolicy JWT config — overridden by keycloak role)
 keycloak_hostname: "keycloak.{{ base_domain_name }}"

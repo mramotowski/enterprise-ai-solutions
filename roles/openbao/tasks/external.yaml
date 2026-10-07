@@ -1,0 +1,60 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Install (openbao_mode: external)
+#
+# The operator runs OpenBao and pre-creates the KV mount, Kubernetes auth,
+# policies, roles and audit device with the template in docs/deploy/openbao.md
+# ("External OpenBao"). The installer only creates the Kubernetes side —
+# namespace openbao_namespace, ServiceAccount openbao_operator_sa (bound by the
+# operator role) and ConfigMap openbao_ca_bundle_configmap — then checks the
+# external OpenBao read-only (external_checks.yaml) and fails fast, before ESO
+# and the layers. It never writes OpenBao configuration.
+
+- name: "openbao | external | Ensure namespace"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ openbao_namespace }}"
+
+# Nothing runs in it in external mode; restricted costs nothing.
+- name: "openbao | external | Label namespace — PSS"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ openbao_namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: "restricted"
+          pod-security.kubernetes.io/audit: "restricted"
+          pod-security.kubernetes.io/warn: "restricted"
+  when: enforce_pss | default(false) | bool
+
+- name: "openbao | external | ServiceAccount for the operator role"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ openbao_operator_sa }}"
+        namespace: "{{ openbao_operator_namespace }}"
+
+- name: "openbao | external | CA bundle"
+  ansible.builtin.include_tasks: ca_bundle.yaml
+
+- name: "openbao | external | Check the external OpenBao"
+  ansible.builtin.include_tasks: external_checks.yaml
+
+- name: "openbao | external | Install complete"
+  ansible.builtin.debug:
+    msg: >-
+      External OpenBao {{ _openbao_address }} is ready for cluster id '{{ _openbao_cluster_id }}'
+      (auth/{{ _openbao_auth_mount }}, KV '{{ openbao_kv_mount }}'). CA in ConfigMap
+      {{ openbao_namespace }}/{{ openbao_ca_bundle_configmap }}. Runbook: docs/deploy/openbao.md.

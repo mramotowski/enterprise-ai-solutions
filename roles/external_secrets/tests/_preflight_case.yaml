@@ -1,0 +1,39 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One preflight failure case of render_test.yaml (_case: {name, vars, expect}).
+
+- name: "external_secrets | test | {{ _case.name }} | Reset result"
+  ansible.builtin.set_fact:
+    _pf_msg: ""
+    _pf_failed: false
+
+- name: "external_secrets | test | {{ _case.name }} | Run preflight"
+  block:
+    - name: "external_secrets | test | {{ _case.name }} | Include preflight"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: preflight.yaml
+      vars:
+        secrets_backend: "{{ _case.vars.secrets_backend | default('openbao') }}"
+        openbao_mode: "{{ _case.vars.openbao_mode | default('internal') }}"
+        openbao_address: "{{ _case.vars.openbao_address | default('') }}"
+        openbao_auth_mount: "{{ _case.vars.openbao_auth_mount | default('kubernetes') }}"
+        openbao_layers: "{{ _case.vars.openbao_layers | default(['erag']) }}"
+        openbao_cluster_id: "{{ _case.vars.openbao_cluster_id | default('') }}"
+        openbao_kv_mount: "{{ _case.vars.openbao_kv_mount | default('intel-ai') }}"
+        openbao_auth_audience: "{{ _case.vars.openbao_auth_audience | default('vault') }}"
+  rescue:
+    - name: "external_secrets | test | {{ _case.name }} | Record failure"
+      ansible.builtin.set_fact:
+        _pf_failed: true
+        _pf_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "external_secrets | test | {{ _case.name }} | Assert preflight failed clearly"
+  ansible.builtin.assert:
+    that:
+      - _pf_failed
+      - _pf_msg is search(_case.expect)
+    fail_msg: "Expected preflight to fail with /{{ _case.expect }}/, got failed={{ _pf_failed }}: {{ _pf_msg }}"
+    quiet: true

@@ -1,0 +1,87 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Route (openbao_mode: internal)
+#
+# openbao_route_enabled: apply the HTTPRoute, BackendTLSPolicy and no-auth
+# SecurityPolicy of templates/route.yaml.j2. Otherwise (and on teardown, with
+# _openbao_route_prune: true) delete them, so turning the route off removes it.
+# The hostname is reserved to openbao_namespace by the envoy_gateway role
+# (gateway_protected_hostnames) whenever secrets_backend is openbao.
+
+- name: "openbao | route | Decide"
+  ansible.builtin.set_fact:
+    _openbao_route_on: >-
+      {{ (openbao_route_enabled | default(false) | bool)
+         and not (_openbao_external | default(false) | bool)
+         and not (_openbao_route_prune | default(false) | bool) }}
+
+- name: "openbao | route | Publish {{ openbao_route_hostname }}"
+  when: _openbao_route_on | bool
+  block:
+    - name: "openbao | route | Gateway API and Envoy Gateway CRDs"
+      ansible.builtin.include_tasks: route_preflight.yaml
+
+    - name: "openbao | route | Apply HTTPRoute, BackendTLSPolicy and SecurityPolicy"
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('ansible.builtin.template', 'route.yaml.j2') | ansible.builtin.from_yaml_all | list }}"
+
+    - name: "openbao | route | Wait until {{ openbao_route_gateway_name }} accepts the HTTPRoute"
+      kubernetes.core.k8s_info:
+        api_version: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        name: "{{ openbao_route_name }}"
+        namespace: "{{ openbao_namespace }}"
+      register: _openbao_route_status
+      vars:
+        _conds: >-
+          {{ (((_openbao_route_status.resources | default([{}]) | first).status | default({})).parents | default([])
+              | selectattr('parentRef.name', 'eq', openbao_route_gateway_name) | map(attribute='conditions') | flatten) }}
+      until:
+        - _conds | selectattr('type', 'eq', 'Accepted') | selectattr('status', 'eq', 'True') | list | length > 0
+        - _conds | selectattr('type', 'eq', 'ResolvedRefs') | selectattr('status', 'eq', 'True') | list | length > 0
+      retries: "{{ openbao_route_wait_retries }}"
+      delay: "{{ openbao_route_wait_delay }}"
+      failed_when: false
+
+    - name: "openbao | route | Assert the HTTPRoute is accepted with resolved backends"
+      vars:
+        _parents: "{{ ((_openbao_route_status.resources | default([{}]) | first).status | default({})).parents | default([]) | selectattr('parentRef.name', 'eq', openbao_route_gateway_name) | list }}"
+        _conds: "{{ _parents | map(attribute='conditions') | flatten }}"
+      ansible.builtin.assert:
+        that:
+          - _conds | selectattr('type', 'eq', 'Accepted') | selectattr('status', 'eq', 'True') | list | length > 0
+          - _conds | selectattr('type', 'eq', 'ResolvedRefs') | selectattr('status', 'eq', 'True') | list | length > 0
+        fail_msg: >-
+          HTTPRoute {{ openbao_namespace }}/{{ openbao_route_name }} for {{ openbao_route_hostname }} is not
+          Accepted and ResolvedRefs on {{ openbao_route_gateway_namespace }}/{{ openbao_route_gateway_name }}
+          (conditions: {{ _conds | map(attribute='type') | zip(_conds | map(attribute='status'), _conds | map(attribute='reason', default='')) | map('join', '=') | join(', ') or 'none yet' }}).
+          Likely causes: the hostname is not covered by a listener of the gateway (https listener,
+          certificate for {{ openbao_route_hostname }}), the gateway_protected_hostnames admission policy,
+          or BackendTLSPolicy {{ openbao_route_backend_tls_policy_name }} (ConfigMap {{ openbao_ca_bundle_configmap }},
+          hostname {{ openbao_route_backend_hostname }}). Check kubectl -n {{ openbao_namespace }} describe
+          httproute {{ openbao_route_name }}, or set openbao_route_enabled: false.
+        quiet: true
+
+- name: "openbao | route | Remove the route objects"
+  when: not (_openbao_route_on | bool)
+  kubernetes.core.k8s:
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ openbao_namespace }}"
+    state: absent
+  loop:
+    - {api_version: gateway.envoyproxy.io/v1alpha1, kind: SecurityPolicy, name: "{{ openbao_route_security_policy_name }}"}
+    - {api_version: gateway.networking.k8s.io/v1, kind: HTTPRoute, name: "{{ openbao_route_name }}"}
+    - {api_version: gateway.networking.k8s.io/v1, kind: BackendTLSPolicy, name: "{{ openbao_route_backend_tls_policy_name }}"}
+  loop_control:
+    label: "{{ item.kind }}/{{ item.name }}"
+  register: _openbao_route_rm
+  # The objects, or their CRDs, may never have existed; any other error (RBAC,
+  # API) fails, since it could leave a no-auth route published.
+  failed_when: >-
+    _openbao_route_rm is failed and not ((_openbao_route_rm.msg | default('') | string)
+    is search('not found|could not find the requested resource|Failed to find exact match', ignorecase=True))

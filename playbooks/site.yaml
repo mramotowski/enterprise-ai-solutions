@@ -17,7 +17,10 @@
     # Shared vars for solution-layer roles dispatched via site.yaml
     log_dir: "{{ env_dir | default(playbook_dir + '/../env/local') }}/logs"
     tmp_dir: "{{ log_dir }}/tmp"
-    secure_logs: false
+    # Derived from the secrets backend (AD-11): true with openbao, false (as before)
+    # with local. A play var loses to extra-vars, so preflight fails if one forces
+    # it false while secrets_backend is openbao.
+    secure_logs: "{{ (secrets_backend | default('local')) == 'openbao' }}"
     helm_timeout: "600s"
     helm_wait: true
     helm_retries: 3

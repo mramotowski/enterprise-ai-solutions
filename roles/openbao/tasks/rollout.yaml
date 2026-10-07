@@ -1,0 +1,124 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — guided rolling restart after a chart or config change
+# (openbao_upgrade: true, internal mode; included by install_internal.yaml after
+# the Helm upgrade and the pod wait, before init.yaml's final state check).
+#
+# The StatefulSet uses OnDelete, so Helm changes no running pod, and every
+# restarted pod comes back sealed. One pod at a time:
+#   1. pods a scale-up just created (ordinal >= the previous replica count):
+#      wait for the operator to unseal them (that is how a new pod joins Raft);
+#   2. pods whose controller-revision-hash is not the StatefulSet's
+#      updateRevision: the standbys first, the active pod last; each is deleted,
+#      waits Running, then the run pauses until the operator unsealed it.
+# The unseal shares are typed by the operator into kubectl exec in another
+# terminal; they never pass through Ansible. A pod that is not unsealed in time
+# fails the run; re-running continues (the pre-check reports the sealed pod).
+#
+# Without openbao_upgrade it only reports what an upgrade would restart. Not
+# run on a fresh install (no StatefulSet before this run: init.yaml follows).
+# After a confirmed scale-down it lists the removed pods' PVCs to delete.
+#
+# Input: _openbao_current_replicas (replicas_guard.yaml).
+
+- name: "openbao | rollout | Upgrade an existing StatefulSet"
+  when: (_openbao_current_replicas | int) > 0
+  block:
+    - name: "openbao | rollout | Wait for the StatefulSet to observe the upgrade"
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: StatefulSet
+        name: "{{ openbao_fullname }}"
+        namespace: "{{ openbao_namespace }}"
+      register: _openbao_sts
+      until:
+        - _openbao_sts.resources | default([]) | length == 1
+        - (_openbao_sts.resources[0].status.observedGeneration | default(-1)) == _openbao_sts.resources[0].metadata.generation
+        - (_openbao_sts.resources[0].status.updateRevision | default('')) | length > 0
+      retries: 30
+      delay: 2
+
+    - name: "openbao | rollout | List server pods"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ openbao_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=openbao"
+          - "app.kubernetes.io/instance={{ openbao_helm_release_name }}"
+          - "component=server"
+      register: _openbao_roll_pods
+
+    - name: "openbao | rollout | Plan"
+      ansible.builtin.include_tasks: rollout_plan.yaml
+
+    - name: "openbao | rollout | Nothing to roll"
+      ansible.builtin.debug:
+        msg: "Every OpenBao pod runs the current revision; no pod needs a restart or an unseal."
+      when: _openbao_roll_plan | length == 0
+
+    - name: "openbao | rollout | Pods waiting for an upgrade"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ _openbao_roll_plan | map(attribute='name') | join(', ') }} still run(s) an older
+          revision of the OpenBao pod template or wait(s) for an unseal (the StatefulSet uses OnDelete).
+          Restart them with unseal pauses: ./es_auto_installer.sh install openbao --env
+          {{ env_name | default('<env>') }} --only -- -e openbao_upgrade=true (docs/deploy/openbao.md, "Upgrades").
+      when:
+        - _openbao_roll_plan | length > 0
+        - not (openbao_upgrade | bool)
+
+    - name: "openbao | rollout | Restart and unseal pod by pod"
+      when:
+        - _openbao_roll_plan | length > 0
+        - openbao_upgrade | bool
+      block:
+        - name: "openbao | rollout | Preflight (terminal)"
+          ansible.builtin.include_tasks: tty_interactive.yaml
+          vars:
+            _openbao_tty_purpose: >-
+              the OpenBao upgrade pauses until you have unsealed each restarted or new pod
+              ({{ _openbao_roll_plan | map(attribute='name') | join(', ') }})
+            _openbao_tty_hint: >-
+              The chart was upgraded, but no pod was restarted. Re-run from a terminal, or roll the
+              pods by hand (docs/deploy/openbao.md, "Upgrades").
+
+        - name: "openbao | rollout | Plan"
+          ansible.builtin.debug:
+            msg: >-
+              {{ _openbao_roll_plan | length }} pod(s), one at a time:
+              {% for p in _openbao_roll_plan %}{{ p.name }} ({{ 'restart, then unseal' if p.delete else 'new: unseal to join' }}){{ ', ' if not loop.last else '' }}{% endfor %}.
+              Keep {{ openbao_key_threshold }} unseal shares at hand.
+
+        - name: "openbao | rollout | Pod"
+          ansible.builtin.include_tasks: roll_pod.yaml
+          loop: "{{ _openbao_roll_plan }}"
+          loop_control:
+            loop_var: _openbao_roll_pod
+            label: "{{ _openbao_roll_pod.name }}"
+
+    # A confirmed scale-down (replicas_guard.yaml) leaves the removed pods' volumes:
+    # an old copy of the Raft data that must not rejoin later under the same name.
+    - name: "openbao | rollout | PVCs of removed pods"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ openbao_namespace }}"
+      register: _openbao_roll_pvcs
+      when: _openbao_removed_ordinals | default([]) | length > 0
+
+    - name: "openbao | rollout | Delete the removed pods' PVCs"
+      vars:
+        _left: >-
+          {{ _openbao_roll_pvcs.resources | default([]) | map(attribute='metadata.name')
+             | select('in', _openbao_removed_ordinals | map('regex_replace', '^', 'data-' ~ openbao_fullname ~ '-') | list) | list }}
+      ansible.builtin.debug:
+        msg: >-
+          Scaled down to {{ openbao_replicas }}. Delete the volumes of the removed pods once they are gone,
+          before any later scale-up: {% for p in _left %}kubectl -n {{ openbao_namespace }} delete pvc {{ p }}{{ '; ' if not loop.last else '' }}{% endfor %}
+          (docs/deploy/openbao.md, "Scale down").
+      when:
+        - _openbao_removed_ordinals | default([]) | length > 0
+        - _left | length > 0

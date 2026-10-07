@@ -1,0 +1,718 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — local proof of files/bootstrap.sh (no cluster access).
+#
+# Runs the script against quay.io/openbao/openbao:2.7.0 in Docker (integrated
+# Raft, TLS off locally, the audit and generate-root settings of
+# templates/values.yaml.j2). files/ is mounted read-only where the chart mounts
+# the bootstrap ConfigMap and the script runs as `/bin/sh <path> <mode> <specs>`
+# with env only, the same shape as the k8s_exec in tasks/bootstrap_exec.yaml. Rows:
+#   bad shares       threshold 4 > shares 3: fails before init, nothing changed
+#   fresh init       5 shares, KV mount, auth/kubernetes, AD-7 roles and policies,
+#                    stdout audit device; the old root token is revoked
+#   re-run healthy   no change, no shares
+#   unreachable peer a peer address that never answers: peer_unreachable
+#   missing marker   a role deleted, then the KV mount, then auth/kubernetes
+#                    disabled (via a generate-root token): fails, names each
+#   sealed           container restarted: fails with pod 0 listed, stays sealed
+#   bootstrap error  no in-cluster CA (auth config fails): shares still
+#                    returned, root revoked, run fails
+# Every task that sees shares sets no_log; containers and the temp dir are
+# removed at the end.
+#
+# Run from the repo root:
+#   ansible-playbook -i localhost, -c local roles/openbao/tests/bootstrap_test.yaml
+
+- name: "openbao | bootstrap test"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role_dir: "{{ playbook_dir | dirname }}"
+    _image: "quay.io/openbao/openbao:2.7.0"
+    _script_dir: "/openbao/userconfig/openbao-bootstrap"
+    _script_path: "{{ _script_dir }}/bootstrap.sh"
+    _inspect: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/files/inspect.sh') }}"
+    _layer_specs: ["erag:erag-secrets:erag-secrets-worker"]
+    _base_env:
+      OB_KEY_SHARES: "5"
+      OB_KEY_THRESHOLD: "3"
+      OB_KV_MOUNT: intel-ai
+      OB_CLUSTER_ID: test-cluster
+      OB_AUDIENCE: vault
+      OB_ESO_SA: external-secrets
+      OB_ESO_NAMESPACE: external-secrets
+      OB_OPERATOR_SA: openbao-operator
+      OB_OPERATOR_NAMESPACE: openbao
+      OB_OPERATOR_TOKEN_TTL: 1h
+      OB_BACKUP_SA: openbao-snapshot
+      OB_BACKUP_NAMESPACE: openbao-backup
+      OB_PEER_ADDRS: ""
+      OB_TIMEOUT: "60"
+      OB_K8S_HOST: https://kubernetes.default.svc
+    _roles: [eso-erag, erag-secrets-worker, erag-secrets-importer, operator, backup]
+  tasks:
+    # set_fact pins the random suffix (a play var would be re-rolled per use).
+    - name: "openbao | bootstrap test | Container name suffix"
+      ansible.builtin.set_fact:
+        _suffix: "{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_lowercase', 'digits'], length=8) }}"
+
+    - name: "openbao | bootstrap test | Container names"
+      ansible.builtin.set_fact:
+        _c1: "openbao-bootstrap-test-{{ _suffix }}-1"
+        _c2: "openbao-bootstrap-test-{{ _suffix }}-2"
+
+    - name: "openbao | bootstrap test | Create temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: openbao-bootstrap-
+      register: _tmp
+
+    - name: "openbao | bootstrap test | Run"
+      block:
+        - name: "openbao | bootstrap test | Load role defaults"
+          ansible.builtin.include_vars:
+            file: "{{ _role_dir }}/defaults/main.yaml"
+            name: _defaults
+
+        - name: "openbao | bootstrap test | Config and fake ServiceAccount dirs"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}/{{ item }}"
+            state: directory
+            mode: "0755"
+          loop: [cfg, sa]
+
+        # The chart's listener TLS and retry_join are left out; the audit and
+        # generate-root settings are those of templates/values.yaml.j2.
+        - name: "openbao | bootstrap test | Server config"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/cfg/server.hcl"
+            mode: "0644"
+            content: |
+              storage "raft" {
+                path    = "/openbao/data"
+                node_id = "test-0"
+              }
+              listener "tcp" {
+                address     = "127.0.0.1:8200"
+                tls_disable = true
+                disable_unauthed_generate_root_endpoints = false
+              }
+              api_addr      = "http://127.0.0.1:8200"
+              cluster_addr  = "http://127.0.0.1:8201"
+              disable_mlock = true
+              audit "file" "{{ _defaults.openbao_audit_path }}" {
+                options {
+                  file_path = "stdout"
+                }
+              }
+
+        # auth/kubernetes with disable_local_ca_jwt=false reads the pod's CA and
+        # token; a throwaway self-signed CA stands in for the cluster's.
+        - name: "openbao | bootstrap test | Fake in-cluster CA"
+          ansible.builtin.command:
+            argv: [openssl, req, -x509, -newkey, ec, -pkeyopt, "ec_paramgen_curve:prime256v1", -nodes,
+                   -keyout, /dev/null, -out, "{{ _tmp.path }}/sa/ca.crt", -subj, /CN=bootstrap-test-ca, -days, "1"]
+          changed_when: true
+
+        - name: "openbao | bootstrap test | Fake ServiceAccount token and namespace"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/sa/{{ item.f }}"
+            content: "{{ item.c }}"
+            mode: "0644"
+          loop:
+            - {f: token, c: "not-a-real-token"}
+            - {f: namespace, c: "openbao"}
+
+        - name: "openbao | bootstrap test | Fix CA mode"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}/sa/ca.crt"
+            mode: "0644"
+
+        - name: "openbao | bootstrap test | Start containers (2 = no in-cluster CA)"
+          ansible.builtin.command:
+            argv: "{{ ['docker', 'run', '-d', '--name', item.name, '-e', 'SKIP_SETCAP=true',
+                       '-e', 'BAO_ADDR=http://127.0.0.1:8200', '-v', _tmp.path ~ '/cfg:/openbao/config:ro',
+                       '-v', _role_dir ~ '/files:' ~ _script_dir ~ ':ro']
+                      + item.extra + [_image, 'server'] }}"
+          loop:
+            - {name: "{{ _c1 }}", extra: ["-v", "{{ _tmp.path }}/sa:/var/run/secrets/kubernetes.io/serviceaccount:ro"]}
+            - {name: "{{ _c2 }}", extra: []}
+          loop_control:
+            label: "{{ item.name }}"
+          changed_when: true
+
+        - name: "openbao | bootstrap test | Wait for both servers"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ item }}", bao, status, -format=json]
+          loop: ["{{ _c1 }}", "{{ _c2 }}"]
+          register: _up
+          until: _up.rc == 2
+          retries: 30
+          delay: 1
+          changed_when: false
+          failed_when: false
+
+        # ── bad shares ──────────────────────────────────────────────────────
+        - name: "openbao | bootstrap test | Row bad shares"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init, env: {OB_KEY_SHARES: "3", OB_KEY_THRESHOLD: "4"}}
+
+        - name: "openbao | bootstrap test | Assert bad shares fail before init"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int != 0
+              - _bs.state == 'bad_params'
+              - _bs.error is search('openbao_key_threshold \(4\)') and _bs.error is search('openbao_key_shares \(3\)')
+              - _bs_shares is none
+            quiet: true
+
+        - name: "openbao | bootstrap test | Status after bad shares"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: status}
+
+        - name: "openbao | bootstrap test | Assert nothing changed"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int == 0
+              - _bs.state == 'uninitialized'
+            quiet: true
+
+        # ── fresh init ──────────────────────────────────────────────────────
+        - name: "openbao | bootstrap test | Row fresh init"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init}
+
+        - name: "openbao | bootstrap test | Keep the shares and accessor (no_log)"
+          ansible.builtin.set_fact:
+            _c1_shares: "{{ _bs_shares }}"
+            _c1_accessor: "{{ _bs.root_accessor }}"
+          no_log: true
+
+        - name: "openbao | bootstrap test | Assert fresh init result"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int == 0
+              - _bs.state == 'initialized'
+              - _bs.bootstrap_ok
+              - _bs.root_revoked
+              - _bs.root_accessor | length > 0
+              - _bs.sealed_pods == ''
+              - _bs.error == ''
+              - _bs_stdout_lines | int == 1
+              - _c1_shares | length == 5
+              - _c1_shares | unique | length == 5
+              # No share in the script's stderr.
+              - _c1_shares | select('in', _bs_stderr) | list | length == 0
+            fail_msg: "fresh init: rc={{ _bs_rc }} {{ _bs | to_json }} (shares: {{ _c1_shares | default([]) | length }})"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Inspect the bootstrap with a generate-root token"
+          ansible.builtin.command:
+            argv: "{{ ['docker', 'exec', '-i', _c1, '/bin/sh', '-c', _inspect, 'inspect', 'inspect', _c1_accessor] + _roles }}"
+            stdin: "{{ _c1_shares | join('\n') }}"
+          register: _inspect_raw
+          changed_when: false
+          no_log: true
+
+        - name: "openbao | bootstrap test | Parse inspection"
+          ansible.builtin.set_fact:
+            _insp: "{{ _inspect_raw.stdout | trim | from_json }}"
+            _inspect_rc: "{{ _inspect_raw.rc }}"
+          no_log: true
+
+        - name: "openbao | bootstrap test | Assert KV mount, auth, audit and root revoke"
+          vars:
+            _kv: "{{ _insp.mounts['intel-ai/'] | default({}) }}"
+            _cfg: "{{ _insp.k8s_config.data }}"
+            _audit: "{{ _insp.audit[_defaults.openbao_audit_path ~ '/'] | default({}) }}"
+          ansible.builtin.assert:
+            that:
+              - _inspect_rc | int == 0
+              - _kv.type == 'kv'
+              - _kv.options.version == '2'
+              - _insp.auths['kubernetes/'].type == 'kubernetes'
+              - _cfg.kubernetes_host == 'https://kubernetes.default.svc'
+              - _cfg.disable_local_ca_jwt == false
+              - _audit.type == 'file'
+              - _audit.options.file_path == 'stdout'
+              # The init root token is gone: its accessor no longer resolves.
+              - _insp.root_accessor_lookup_rc | int != 0
+            fail_msg: "{{ _insp | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Assert AD-7 roles"
+          vars:
+            _r: "{{ _insp.roles }}"
+            _bind:
+              eso-erag: [external-secrets, external-secrets]
+              erag-secrets-worker: [erag-secrets-worker, erag-secrets]
+              erag-secrets-importer: [erag-secrets-importer, erag-secrets]
+              operator: [openbao-operator, openbao]
+              backup: [openbao-snapshot, openbao-backup]
+          ansible.builtin.assert:
+            that:
+              - _r[item].data.audience == 'vault'
+              - _r[item].data.bound_service_account_names == [_bind[item][0]]
+              - _r[item].data.bound_service_account_namespaces == [_bind[item][1]]
+              - _r[item].data.token_policies == [item]
+              - item != 'operator' or (_r[item].data.token_ttl == 3600 and _r[item].data.token_max_ttl == 3600)
+            fail_msg: "role {{ item }}: {{ _r[item] | default('missing') | to_json }}"
+            quiet: true
+          loop: "{{ _roles }}"
+
+        - name: "openbao | bootstrap test | Assert one path block per AD-7 rule"
+          vars:
+            _paths: {eso-erag: 1, erag-secrets-worker: 2, erag-secrets-importer: 1, operator: 2, backup: 2}
+          ansible.builtin.assert:
+            that:
+              - _insp.policies[item].policy is defined
+              - (_insp.policies[item].policy | regex_findall('path "') | length) == _paths[item]
+            fail_msg: "policy {{ item }}: {{ _insp.policies[item] | default('missing') | to_json }}"
+            quiet: true
+          loop: "{{ _roles }}"
+
+        - name: "openbao | bootstrap test | Assert policy rules match AD-7"
+          ansible.builtin.assert:
+            that:
+              - _insp.policies[item.0].policy is search(item.1)
+            fail_msg: "policy {{ item.0 }} lacks /{{ item.1 }}/: {{ _insp.policies[item.0].policy | default('missing') }}"
+            quiet: true
+          loop: >-
+            {{ [
+              ['eso-erag', 'path "intel-ai/data/test-cluster/erag/\*" \{\s*capabilities = \["read"\]\s*\}'],
+              ['erag-secrets-worker', 'path "intel-ai/data/test-cluster/erag/\*" \{\s*capabilities = \["create", "update", "read", "delete"\]'],
+              ['erag-secrets-worker', 'path "intel-ai/metadata/test-cluster/erag/\*" \{\s*capabilities = \["read", "list", "delete"\]'],
+              ['erag-secrets-importer', 'path "intel-ai/data/test-cluster/erag/\*" \{\s*capabilities = \["create", "update", "read"\]\s*\}'],
+              ['operator', 'path "intel-ai/\+/test-cluster/\*" \{\s*capabilities = \["read", "create", "update", "list"\]'],
+              ['operator', 'path "sys/audit" \{\s*capabilities = \["read", "sudo"\]\s*\}'],
+              ['backup', 'path "sys/storage/raft/snapshot" \{\s*capabilities = \["read"\]'],
+              ['backup', 'path "sys/storage/raft/snapshot-force" \{\s*capabilities = \["update"\]']
+            ] }}
+          loop_control:
+            label: "{{ item.0 }}"
+
+        # ── re-run healthy ──────────────────────────────────────────────────
+        - name: "openbao | bootstrap test | Row re-run healthy"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init}
+
+        - name: "openbao | bootstrap test | Assert re-run is a no-op"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int == 0
+              - _bs.state == 'ok'
+              - _bs.missing == ''
+              - _bs_shares is none
+            fail_msg: "re-run: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        # ── unreachable peer ────────────────────────────────────────────────
+        - name: "openbao | bootstrap test | Row unreachable peer"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init, env: {OB_PEER_ADDRS: "http://127.0.0.1:1", OB_TIMEOUT: "4"}}
+
+        - name: "openbao | bootstrap test | Assert unreachable peer is its own state"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int != 0
+              - _bs.state == 'peer_unreachable'
+              - _bs.unreachable_pods == '1'
+              - _bs.sealed_pods == ''
+              - _bs_shares is none
+            fail_msg: "unreachable peer: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        # ── missing marker ──────────────────────────────────────────────────
+        - name: "openbao | bootstrap test | Delete role erag-secrets-importer (generate-root token)"
+          ansible.builtin.command:
+            argv: [docker, exec, -i, "{{ _c1 }}", /bin/sh, -c, "{{ _inspect }}", inspect, delete-role, erag-secrets-importer]
+            stdin: "{{ _c1_shares | join('\n') }}"
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | bootstrap test | Row missing marker"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init}
+
+        - name: "openbao | bootstrap test | Assert missing role fails"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int != 0
+              - _bs.state == 'missing_bootstrap'
+              - _bs.missing == 'role:erag-secrets-importer'
+              - _bs_shares is none
+            fail_msg: "missing: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Disable the KV mount (generate-root token)"
+          ansible.builtin.command:
+            argv: [docker, exec, -i, "{{ _c1 }}", /bin/sh, -c, "{{ _inspect }}", inspect, disable-mount, intel-ai]
+            stdin: "{{ _c1_shares | join('\n') }}"
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | bootstrap test | Row disabled KV mount"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init}
+
+        - name: "openbao | bootstrap test | Assert missing KV mount fails"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int != 0
+              - _bs.state == 'missing_bootstrap'
+              - _bs.missing.split() | sort == ['kv-mount:intel-ai', 'role:erag-secrets-importer']
+            fail_msg: "kv disabled: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Disable auth/kubernetes (generate-root token)"
+          ansible.builtin.command:
+            argv: [docker, exec, -i, "{{ _c1 }}", /bin/sh, -c, "{{ _inspect }}", inspect, disable-auth, kubernetes]
+            stdin: "{{ _c1_shares | join('\n') }}"
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | bootstrap test | Row disabled auth/kubernetes"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init}
+
+        - name: "openbao | bootstrap test | Assert missing auth fails"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int != 0
+              - _bs.state == 'missing_bootstrap'
+              - _bs.missing.split() | sort == ['auth:kubernetes', 'kv-mount:intel-ai']
+            fail_msg: "auth disabled: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        # ── apply (temporary generate-root token on stdin) ─────────────────
+        # Role, KV mount and auth/kubernetes are gone now, and a second layer is
+        # requested: apply converges all of it and revokes the token.
+        - name: "openbao | bootstrap test | Row apply (generate-root token piped in, extra layer)"
+          vars:
+            _env_args: >-
+              {% set r = [] %}{% for k, v in _base_env.items() %}{% set _ = r.extend(['-e', k ~ '=' ~ v]) %}{% endfor %}{{ r }}
+          ansible.builtin.command:
+            argv: "{{ ['docker', 'exec', '-i'] + _env_args + [_c1, '/bin/sh', '-c', _inspect, 'inspect', 'apply'] + _layer_specs + ['inference:inference-secrets:inference-secrets-worker'] }}"
+            stdin: "{{ _c1_shares | join('\n') }}"
+          register: _apply_raw
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | bootstrap test | Parse apply result"
+          ansible.builtin.set_fact:
+            _apply: "{{ (_apply_raw.stdout | trim).splitlines() | last | from_json }}"
+          no_log: true
+
+        - name: "openbao | bootstrap test | Assert apply converged and revoked its token"
+          ansible.builtin.assert:
+            that:
+              - _apply.apply_rc | int == 0
+              - _apply.apply.state == 'applied'
+              - _apply.apply.bootstrap_ok
+              - _apply.apply.root_revoked
+              - _apply.apply.missing == ''
+              - _apply.apply.root_accessor | length > 0
+              - _apply.apply.shares is none
+              # The temporary token no longer works.
+              - _apply.temp_token_lookup_rc | int != 0
+            fail_msg: "apply: {{ _apply | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Row status with both layers after apply"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: status}
+            _layer_specs: ["erag:erag-secrets:erag-secrets-worker", "inference:inference-secrets:inference-secrets-worker"]
+
+        - name: "openbao | bootstrap test | Assert markers complete for both layers"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int == 0
+              - _bs.state == 'ok'
+              - _bs.missing == ''
+            fail_msg: "status after apply: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Inspect after apply"
+          ansible.builtin.command:
+            argv: "{{ ['docker', 'exec', '-i', _c1, '/bin/sh', '-c', _inspect, 'inspect', 'inspect', _apply.apply.root_accessor] + _roles + ['eso-inference', 'inference-secrets-worker', 'inference-secrets-importer'] }}"
+            stdin: "{{ _c1_shares | join('\n') }}"
+          register: _inspect3_raw
+          changed_when: false
+          no_log: true
+
+        - name: "openbao | bootstrap test | Assert mount, auth and the new layer's roles after apply"
+          vars:
+            _i: "{{ _inspect3_raw.stdout | trim | from_json }}"
+          ansible.builtin.assert:
+            that:
+              - _i.mounts['intel-ai/'].type == 'kv'
+              - _i.mounts['intel-ai/'].options.version == '2'
+              - _i.auths['kubernetes/'].type == 'kubernetes'
+              - _i.roles['erag-secrets-importer'].data.bound_service_account_names == ['erag-secrets-importer']
+              - _i.roles['inference-secrets-worker'].data.bound_service_account_names == ['inference-secrets-worker']
+              - _i.roles['inference-secrets-worker'].data.bound_service_account_namespaces == ['inference-secrets']
+              - _i.roles['eso-inference'].data.token_policies == ['eso-inference']
+              - _i.policies['inference-secrets-worker'].policy is search('intel-ai/data/test-cluster/inference/')
+              - _i.policies['operator'].policy is search('"read", "sudo"')
+              # The apply token's accessor no longer resolves.
+              - _i.root_accessor_lookup_rc | int != 0
+            fail_msg: "{{ _i | to_json }}"
+            quiet: true
+
+        # Re-apply on a bootstrapped OpenBao: everything exists, one binding is old.
+        - name: "openbao | bootstrap test | Re-bind role backup to namespace openbao (old install)"
+          ansible.builtin.command:
+            argv: [docker, exec, -i, "{{ _c1 }}", /bin/sh, -c, "{{ _inspect }}", inspect, bind-backup, openbao]
+            stdin: "{{ _c1_shares | join('\n') }}"
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | bootstrap test | Row re-apply on a bootstrapped OpenBao"
+          vars:
+            _env_args: >-
+              {% set r = [] %}{% for k, v in _base_env.items() %}{% set _ = r.extend(['-e', k ~ '=' ~ v]) %}{% endfor %}{{ r }}
+          ansible.builtin.command:
+            argv: "{{ ['docker', 'exec', '-i'] + _env_args + [_c1, '/bin/sh', '-c', _inspect, 'inspect', 'apply'] + _layer_specs + ['inference:inference-secrets:inference-secrets-worker'] }}"
+            stdin: "{{ _c1_shares | join('\n') }}"
+          register: _reapply_raw
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | bootstrap test | Inspect role backup after re-apply"
+          ansible.builtin.command:
+            argv: [docker, exec, -i, "{{ _c1 }}", /bin/sh, -c, "{{ _inspect }}", inspect, inspect, none, backup]
+            stdin: "{{ _c1_shares | join('\n') }}"
+          register: _inspect4_raw
+          changed_when: false
+          no_log: true
+
+        - name: "openbao | bootstrap test | Assert re-apply converged the existing bootstrap"
+          vars:
+            _r: "{{ ((_reapply_raw.stdout | trim).splitlines() | last | from_json) }}"
+            _i: "{{ _inspect4_raw.stdout | trim | from_json }}"
+          ansible.builtin.assert:
+            that:
+              - _r.apply_rc | int == 0
+              - _r.apply.state == 'applied'
+              - _r.apply.root_revoked
+              - _r.temp_token_lookup_rc | int != 0
+              - _i.roles.backup.data.bound_service_account_namespaces == ['openbao-backup']
+              - _i.mounts['intel-ai/'].options.version == '2'
+            fail_msg: "re-apply: {{ _r | to_json }} backup: {{ _i.roles.backup | default('missing') | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Replace the KV mount with KV version 1"
+          ansible.builtin.command:
+            argv: [docker, exec, -i, "{{ _c1 }}", /bin/sh, -c, "{{ _inspect }}", inspect, remount-kv1, intel-ai]
+            stdin: "{{ _c1_shares | join('\n') }}"
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | bootstrap test | Row apply over a wrong-type mount"
+          vars:
+            _env_args: >-
+              {% set r = [] %}{% for k, v in _base_env.items() %}{% set _ = r.extend(['-e', k ~ '=' ~ v]) %}{% endfor %}{{ r }}
+          ansible.builtin.command:
+            argv: "{{ ['docker', 'exec', '-i'] + _env_args + [_c1, '/bin/sh', '-c', _inspect, 'inspect', 'apply'] + _layer_specs }}"
+            stdin: "{{ _c1_shares | join('\n') }}"
+          register: _wrongtype_raw
+          changed_when: false
+          no_log: true
+
+        - name: "openbao | bootstrap test | Assert a wrong-type mount is refused, the token revoked"
+          vars:
+            _r: "{{ ((_wrongtype_raw.stdout | trim).splitlines() | last | from_json) }}"
+          ansible.builtin.assert:
+            that:
+              - _r.apply_rc | int == 1
+              - _r.apply.state == 'apply_failed'
+              - _r.apply.error is search('not KV version 2; fix it by hand')
+              - _r.apply.root_revoked
+              - _r.temp_token_lookup_rc | int != 0
+            fail_msg: "wrong type: {{ _r | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Row apply with an invalid token"
+          vars:
+            _env_args: >-
+              {% set r = [] %}{% for k, v in _base_env.items() %}{% set _ = r.extend(['-e', k ~ '=' ~ v]) %}{% endfor %}{{ r }}
+          ansible.builtin.command:
+            argv: "{{ ['docker', 'exec', '-i'] + _env_args + [_c1, '/bin/sh', _script_path, 'apply'] + _layer_specs }}"
+            stdin: "s.not-a-valid-token"
+          register: _apply_bad
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | bootstrap test | Row apply without a token"
+          vars:
+            _env_args: >-
+              {% set r = [] %}{% for k, v in _base_env.items() %}{% set _ = r.extend(['-e', k ~ '=' ~ v]) %}{% endfor %}{{ r }}
+          ansible.builtin.command:
+            argv: "{{ ['docker', 'exec', '-i'] + _env_args + [_c1, '/bin/sh', _script_path, 'apply'] + _layer_specs }}"
+            stdin: ""
+          register: _apply_none
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | bootstrap test | Assert bad or missing token changes nothing"
+          vars:
+            _b: "{{ _apply_bad.stdout | trim | from_json }}"
+            _n: "{{ _apply_none.stdout | trim | from_json }}"
+          ansible.builtin.assert:
+            that:
+              - _apply_bad.rc == 1
+              - _b.state == 'token_invalid'
+              - _b.root_revoked
+              - _apply_none.rc == 1
+              - _n.state == 'token_missing'
+              - _n.root_revoked
+            fail_msg: "bad: {{ _apply_bad.rc }} {{ _apply_bad.stdout }} none: {{ _apply_none.rc }} {{ _apply_none.stdout }}"
+            quiet: true
+
+        # ── sealed ──────────────────────────────────────────────────────────
+        - name: "openbao | bootstrap test | Restart container 1 (seals it)"
+          ansible.builtin.command:
+            argv: [docker, restart, "{{ _c1 }}"]
+          changed_when: true
+
+        - name: "openbao | bootstrap test | Wait for the restarted server"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ _c1 }}", bao, status, -format=json]
+          register: _up1
+          until: _up1.rc == 2
+          retries: 30
+          delay: 1
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | bootstrap test | Row sealed"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init}
+
+        - name: "openbao | bootstrap test | Assert sealed fails and lists pod 0"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int != 0
+              - _bs.state == 'sealed'
+              - _bs.sealed_pods == '0'
+              - _bs_shares is none
+            fail_msg: "sealed: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Row apply while sealed"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: apply}
+
+        - name: "openbao | bootstrap test | Assert apply refuses a sealed OpenBao"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int != 0
+              - _bs.state == 'sealed'
+            fail_msg: "apply sealed: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Seal status after the sealed row"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ _c1 }}", bao, status, -format=json]
+          register: _sealed_status
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | bootstrap test | Assert still initialized and sealed"
+          ansible.builtin.assert:
+            that:
+              - (_sealed_status.stdout | from_json).initialized
+              - (_sealed_status.stdout | from_json).sealed
+              - (_sealed_status.stdout | from_json).progress == 0
+            quiet: true
+
+        # ── bootstrap error ─────────────────────────────────────────────────
+        - name: "openbao | bootstrap test | Row bootstrap error (no in-cluster CA)"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c2 }}", mode: init}
+
+        - name: "openbao | bootstrap test | Keep container 2 shares (no_log)"
+          ansible.builtin.set_fact:
+            _c2_shares: "{{ _bs_shares }}"
+          no_log: true
+
+        - name: "openbao | bootstrap test | Assert shares returned, root revoked, run failed"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int == 1
+              - _bs.state == 'initialized'
+              - not _bs.bootstrap_ok
+              - _bs.stage == 'auth config'
+              - _bs.error is search('ca.crt')
+              - _bs.root_revoked
+              - _c2_shares | length == 5
+              - _c2_shares | select('in', _bs_stderr) | list | length == 0
+            fail_msg: "bootstrap error: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Inspect container 2"
+          ansible.builtin.command:
+            argv: [docker, exec, -i, "{{ _c2 }}", /bin/sh, -c, "{{ _inspect }}", inspect, inspect, "{{ _bs.root_accessor }}"]
+            stdin: "{{ _c2_shares | join('\n') }}"
+          register: _inspect2_raw
+          changed_when: false
+          no_log: true
+
+        - name: "openbao | bootstrap test | Assert container 2 root token revoked"
+          ansible.builtin.assert:
+            that:
+              - (_inspect2_raw.stdout | trim | from_json).root_accessor_lookup_rc | int != 0
+            quiet: true
+
+        - name: "openbao | bootstrap test | All rows passed"
+          ansible.builtin.debug:
+            msg: >-
+              bad shares, fresh init, re-run, unreachable peer, missing role / KV mount /
+              auth, apply (extra layer, bad/missing token, sealed), sealed and bootstrap
+              error rows passed.
+      always:
+        - name: "openbao | bootstrap test | Remove containers"
+          ansible.builtin.command:
+            argv: [docker, rm, -f, -v, "{{ _c1 }}", "{{ _c2 }}"]
+          changed_when: true
+          failed_when: false
+
+        - name: "openbao | bootstrap test | Remove temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent
+
+        - name: "openbao | bootstrap test | Forget shares"
+          ansible.builtin.set_fact:
+            _c1_shares: []
+            _c2_shares: []
+            _bs_shares: null
+          no_log: true
+
+    - name: "openbao | bootstrap test | List leftover containers"
+      ansible.builtin.command:
+        argv: [docker, ps, -a, --filter, "name=openbao-bootstrap-test-{{ _suffix }}", --format, "{{ '{{' }}.Names{{ '}}' }}"]
+      register: _left
+      changed_when: false
+
+    - name: "openbao | bootstrap test | Assert no container left"
+      ansible.builtin.assert:
+        that:
+          - _left.stdout | trim | length == 0
+        fail_msg: "Leftover containers: {{ _left.stdout }}"
+        quiet: true

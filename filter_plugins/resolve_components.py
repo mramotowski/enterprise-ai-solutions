@@ -12,12 +12,37 @@ Usage in preflight.yaml:
 IMPORTANT: `enabled` values must be rendered before reaching this plugin.
 preflight.yaml uses lookup('template', ...) (not 'file') for ext manifests so
 Jinja expressions resolve to "True"/"False" strings; _enabled() coerces those.
+A templated `depends_on` renders to a list literal string ("['a', 'b']", "[]");
+_depends() parses it.
 """
 
+import ast
 import warnings
 from collections import deque
 
 VALID_ACTIONS = ("install", "teardown", "validate")
+
+
+def _depends(entry):
+    """depends_on of a layer or component as a list of names.
+
+    A templated value arrives rendered as a string (a Python/JSON list literal);
+    anything that is not a list of strings is an error, never a list of characters.
+    """
+    val = entry.get("depends_on")
+    if val is None:
+        return []
+    if isinstance(val, str):
+        text = val.strip()
+        if not text:
+            return []
+        try:
+            val = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            raise ValueError("%s: depends_on %r is not a list" % (entry.get("name"), val))
+    if not isinstance(val, (list, tuple)) or not all(isinstance(d, str) for d in val):
+        raise ValueError("%s: depends_on %r is not a list of names" % (entry.get("name"), val))
+    return list(val)
 
 
 def _enabled(component):
@@ -61,10 +86,10 @@ def _resolve_layers(layers, seed_layers, action, include_deps):
     if not include_deps:
         return list(seed_layers)
 
-    deps = {layer["name"]: list(layer.get("depends_on") or []) for layer in layers}
+    deps = {layer["name"]: _depends(layer) for layer in layers}
     rdeps = {}
     for layer in layers:
-        for parent in layer.get("depends_on") or []:
+        for parent in _depends(layer):
             rdeps.setdefault(parent, []).append(layer["name"])
 
     graph = rdeps if action == "teardown" else deps
@@ -129,7 +154,7 @@ def _layer_order(layers, resolved):
     # A component may name a layer nobody declared; keep it, ordered last.
     keys = declared + [n for n in resolved if n not in declared]
 
-    deps = {layer["name"]: [d for d in (layer.get("depends_on") or []) if d in in_set]
+    deps = {layer["name"]: [d for d in _depends(layer) if d in in_set]
             for layer in layers if layer["name"] in in_set}
     ordered, unresolved = _toposort(keys, deps)
     return ordered + unresolved  # cycle: _resolve_layers already warned
@@ -145,7 +170,7 @@ def _component_order(comps):
     positions = {}
     for i, comp in enumerate(comps):
         positions.setdefault(comp["name"], []).append(i)
-    deps = {i: {p for d in (comp.get("depends_on") or [])
+    deps = {i: {p for d in _depends(comp)
                 for p in positions.get(d, ()) if p != i}
             for i, comp in enumerate(comps)}
 
@@ -214,9 +239,9 @@ def resolve_components(components, layers, target, action="install",
                 cname = queue.popleft()
                 if action == "teardown":
                     nxt = [c["name"] for c in components
-                           if cname in (c.get("depends_on") or [])]
+                           if cname in _depends(c)]
                 else:
-                    nxt = by_name.get(cname, {}).get("depends_on") or []
+                    nxt = _depends(by_name.get(cname, {}))
                 for dep in nxt:
                     if dep not in wanted:
                         wanted.add(dep)

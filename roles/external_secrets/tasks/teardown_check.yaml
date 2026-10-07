@@ -1,0 +1,50 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# external_secrets — teardown leftovers (from teardown.yaml). Input: the
+# installer-managed stores (_eso_td_stores) and the looped k8s_info results
+# for every served ESO kind (_eso_td_objects, items {kind, api_version}). With
+# external_secrets_teardown_delete_crds it fails while any ESO object other
+# than the installer's stores exists; otherwise it warns about ExternalSecrets
+# that still use an OpenBao store (an installer-managed one, or any
+# ClusterSecretStore named <external_secrets_store_prefix>*, e.g. on a re-run).
+
+- name: "external_secrets | teardown | Resolve leftovers"
+  vars:
+    _store_names: "{{ _eso_td_stores.resources | default([]) | map(attribute='metadata.name') | list }}"
+    _es: "{{ (_eso_td_objects.results | default([]) | selectattr('item.kind', 'eq', 'ExternalSecret') | first | default({})).resources | default([]) }}"
+  ansible.builtin.set_fact:
+    # ExternalSecrets whose default store or any per-entry store is an OpenBao store.
+    _eso_td_openbao_es: >-
+      {% set r = [] %}{% for e in _es %}{% set refs = [e.spec.secretStoreRef | default({})]
+      + (e.spec.data | default([]) | map(attribute='sourceRef', default={}) | map(attribute='storeRef', default={}) | list)
+      + (e.spec.dataFrom | default([]) | map(attribute='sourceRef', default={}) | map(attribute='storeRef', default={}) | list) %}{% if refs
+      | selectattr('kind', 'defined') | selectattr('kind', 'eq', 'ClusterSecretStore') | selectattr('name', 'defined') | list
+      | map(attribute='name') | select('in', _store_names) | list | length > 0 or (refs | selectattr('kind', 'defined')
+      | selectattr('kind', 'eq', 'ClusterSecretStore') | selectattr('name', 'defined') | map(attribute='name')
+      | select('match', '^' ~ (external_secrets_store_prefix | regex_escape)) | list | length > 0) %}{% set _ = r.append(e.metadata.namespace ~ '/' ~ e.metadata.name) %}{% endif %}{% endfor %}{{ r }}
+    _eso_td_family: >-
+      {% set r = [] %}{% for res in _eso_td_objects.results | default([]) %}{% for o in res.resources | default([])
+      if not (res.item.kind == 'ClusterSecretStore' and o.metadata.name in _store_names) %}{% set _ = r.append(res.item.kind
+      ~ ' ' ~ ((o.metadata.namespace ~ '/') if o.metadata.namespace is defined else '') ~ o.metadata.name) %}{% endfor %}{% endfor %}{{ r }}
+
+- name: "external_secrets | teardown | Refuse to delete the CRDs while objects remain"
+  ansible.builtin.assert:
+    that:
+      - _eso_td_family | length == 0
+    fail_msg: >-
+      external_secrets_teardown_delete_crds=true, but {{ _eso_td_family | length }} ESO object(s) still exist
+      ({{ _eso_td_family[:10] | join(', ') }}{{ ', ...' if _eso_td_family | length > 10 else '' }}). Tear down the
+      layers that own them first (e.g. ./es_auto_installer.sh teardown erag), or run without
+      external_secrets_teardown_delete_crds to keep the CRDs and the Secrets.
+    quiet: true
+  when: external_secrets_teardown_delete_crds | bool
+
+- name: "external_secrets | teardown | ExternalSecrets still using OpenBao stores"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ _eso_td_openbao_es | length }} ExternalSecret(s) still use an OpenBao ClusterSecretStore
+      ({{ _eso_td_openbao_es[:10] | join(', ') }}{{ ', ...' if _eso_td_openbao_es | length > 10 else '' }}).
+      They and the Secrets they own are kept (the CRDs are kept) but are no longer refreshed.
+  when: _eso_td_openbao_es | length > 0

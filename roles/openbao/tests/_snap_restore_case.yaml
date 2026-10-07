@@ -1,0 +1,30 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One snapshot_restore_check.yaml case of render_test.yaml
+# (_case: {name, replicas, pods: [{n, phase, status (stdout)}], job_sealed, sealed}).
+
+- name: "openbao | test | restore check {{ _case.name }} | Run"
+  ansible.builtin.include_role:
+    name: "{{ _role_dir }}"
+    tasks_from: snapshot_restore_check.yaml
+    public: true
+  vars:
+    openbao_replicas: "{{ _case.replicas }}"
+    _openbao_snapshot_result: {sealed: "{{ _case.job_sealed }}"}
+    _openbao_snap_pods:
+      resources: >-
+        {% set r = [] %}{% for p in _case.pods %}{% set _ = r.append({'metadata': {'name': 'openbao-' ~ p.n},
+        'status': {'phase': p.phase}}) %}{% endfor %}{{ r }}
+    _openbao_snap_seal:
+      results: >-
+        {% set r = [] %}{% for p in _case.pods if p.phase == 'Running' %}{% set _ = r.append({'item': 'openbao-' ~ p.n,
+        'stdout': p.status}) %}{% endfor %}{{ r }}
+
+- name: "openbao | test | restore check {{ _case.name }} | Assert"
+  ansible.builtin.assert:
+    that:
+      - _openbao_snap_sealed | map('regex_replace', ' \(.*$', '') | list == _case.sealed
+    fail_msg: "restore check {{ _case.name }}: got {{ _openbao_snap_sealed }}, want {{ _case.sealed }}"
+    quiet: true

@@ -1,0 +1,220 @@
+---
+name: Ansible playbook tests
+
+# Runs the offline Ansible test playbooks of the openbao and external_secrets
+# roles (no cluster: helm template against the pinned charts, OpenBao 2.7.0 in
+# Docker, the Kubernetes API server's admission code built with Go). One job per
+# entry playbook, so a regression fails only its job. Each job runs the command
+# from the playbook's header comment. A separate job checks the module
+# arguments of every task (scripts/check_module_args.py).
+#
+# Actions are pinned to full commit SHAs (the trailing `# vX.Y.Z` is the tag
+# that SHA corresponded to); helm, Go and the direct pip packages to exact
+# versions (helm and Go checksum-verified). Not pinned: transitive pip
+# dependencies (no hashes), and the Docker images, which are pulled by the tags
+# the playbooks reference (postgresql:17 is a moving major tag).
+# ansible 12.3.0 is the newest release in the range of requirements.txt
+# (ansible<13).
+#
+# Only GitHub-hosted runners and public actions are used.
+
+# The triggers are those of the other workflows; the release branch filter
+# writes '.' instead of '\.' ('.' is a literal in the filter syntax, and
+# actionlint rejects the escape).
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'release-[0-9]+.[0-9]+'
+  pull_request:
+    branches:
+      - main
+      - 'release-[0-9]+.[0-9]+'
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Only supersede PR runs; every push to main/release keeps its own result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  playbook-test:
+    name: "${{ matrix.name }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: openbao render
+            playbook: roles/openbao/tests/render_test.yaml
+            helm: true
+            go: false
+            images: ""
+            timeout: 20
+          - name: openbao bootstrap
+            playbook: roles/openbao/tests/bootstrap_test.yaml
+            helm: false
+            go: false
+            images: quay.io/openbao/openbao:2.7.0
+            timeout: 30
+          - name: openbao external
+            playbook: roles/openbao/tests/external_test.yaml
+            helm: false
+            go: false
+            images: quay.io/openbao/openbao:2.7.0
+            timeout: 30
+          - name: openbao ops
+            playbook: roles/openbao/tests/ops_test.yaml
+            helm: false
+            go: false
+            images: quay.io/openbao/openbao:2.7.0
+            timeout: 30
+          - name: external_secrets render
+            playbook: roles/external_secrets/tests/render_test.yaml
+            helm: true
+            go: false
+            images: ""
+            timeout: 20
+          - name: external_secrets admission policy
+            playbook: roles/external_secrets/tests/vap_test.yaml
+            helm: false
+            go: true
+            images: ""
+            timeout: 30
+    steps:
+      - name: Harden the runner (audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.14'
+
+      # PyYAML and jsonschema: external_secrets tests/files/crd_validate.py.
+      - name: Install Ansible
+        run: >-
+          pip install --disable-pip-version-check
+          "ansible==12.3.0" "ansible-core==2.19.13"
+          "Jinja2==3.1.6" "PyYAML==6.0.3" "jsonschema==4.26.0"
+
+      # Installed from the pinned upstream release and checksum-verified.
+      - name: Install helm
+        if: matrix.helm
+        env:
+          HELM_VERSION: v3.20.2
+          HELM_SHA256: 258e830a9e613c8a7a302d6059b4bb3b9758f2f3e1bb8ea0d707ce10a9a72fea
+        run: |
+          file="helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL "https://get.helm.sh/${file}" -o helm.tar.gz
+          echo "${HELM_SHA256}  helm.tar.gz" | sha256sum --check --strict
+          tar -xzf helm.tar.gz
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          rm -rf helm.tar.gz linux-amd64
+          helm version --short
+
+      # Installed from the pinned upstream release and checksum-verified. The
+      # test builds against k8s.io/apiserver v0.34 (needs Go 1.24).
+      - name: Install Go
+        if: matrix.go
+        env:
+          GO_VERSION: go1.24.13
+          GO_SHA256: 1fc94b57134d51669c72173ad5d49fd62afb0f1db9bf3f798fd98ee423f8d730
+        run: |
+          file="${GO_VERSION}.linux-amd64.tar.gz"
+          curl -fsSL "https://go.dev/dl/${file}" -o go.tar.gz
+          echo "${GO_SHA256}  go.tar.gz" | sha256sum --check --strict
+          sudo rm -rf /usr/local/go
+          sudo tar -C /usr/local -xzf go.tar.gz
+          rm go.tar.gz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
+
+      # Pulled before the test so that a registry problem fails here, not as a
+      # test assertion.
+      - name: Pull the test images
+        if: matrix.images != ''
+        env:
+          IMAGES: ${{ matrix.images }}
+        run: |
+          for image in ${IMAGES}; do
+            docker pull "${image}"
+          done
+
+      - name: Run the playbook
+        env:
+          PLAYBOOK: ${{ matrix.playbook }}
+          ANSIBLE_FORCE_COLOR: "0"
+          PY_COLORS: "0"
+        run: ansible-playbook -i localhost, -c local "${PLAYBOOK}"
+
+  # Unknown module arguments (e.g. k8s_info label_selector instead of
+  # label_selectors) pass ansible-lint and the static tests above, and fail
+  # only on a live run. Checks every task with mapping args against ansible-doc.
+  module-args:
+    name: "Module arguments"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Harden the runner (audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.14'
+
+      # As es_auto_installer.sh does: the pinned collections replace the copies
+      # bundled with the ansible package.
+      - name: Install Ansible and the pinned collections
+        run: |
+          pip install --disable-pip-version-check \
+            "ansible==12.3.0" "ansible-core==2.19.13" "Jinja2==3.1.6" "PyYAML==6.0.3"
+          ansible-galaxy collection install -r collections/requirements.yml --force \
+            -p "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          ansible-galaxy collection list kubernetes.core
+
+      # The fixture has three unknown arguments: the check must fail on it.
+      - name: Self-test of the check
+        run: |
+          if python3 scripts/check_module_args.py scripts/testdata/check_module_args; then
+            echo "check_module_args.py did not report the fixture's unknown arguments"
+            exit 1
+          fi
+
+      - name: Check module arguments
+        run: python3 scripts/check_module_args.py roles playbooks
+
+  # Single stable check for branch protection, independent of matrix entries.
+  playbook-tests-result:
+    name: "Ansible playbook tests result"
+    if: always()
+    needs: [playbook-test, module-args]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the playbook test results
+        env:
+          RESULT: ${{ needs.playbook-test.result }}
+          ARGS_RESULT: ${{ needs.module-args.result }}
+        run: |
+          echo "playbook-test: ${RESULT}, module-args: ${ARGS_RESULT}"
+          [[ "${RESULT}" == "success" && "${ARGS_RESULT}" == "success" ]]

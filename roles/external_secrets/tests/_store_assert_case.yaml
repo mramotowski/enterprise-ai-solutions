@@ -1,0 +1,43 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One store status case of render_test.yaml: tasks/store_assert.yaml with a
+# fabricated _eso_store_status (_case: {name, stores: [{name, conds, missing}], expect}).
+
+- name: "external_secrets | test | {{ _case.name }} | Reset result"
+  ansible.builtin.set_fact:
+    _sa_failed: false
+    _sa_msg: ""
+    _eso_store_status:
+      results: >-
+        {% set r = [] %}{% for s in _case.stores %}{% set _ = r.append({'item': {'name': s.name},
+        'resources': [] if s.missing | default(false) else [{'metadata': {'name': s.name}, 'status': {'conditions': s.conds}}]}) %}{% endfor %}{{ r }}
+
+- name: "external_secrets | test | {{ _case.name }} | Run store_assert"
+  block:
+    - name: "external_secrets | test | {{ _case.name }} | Include store_assert"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: store_assert.yaml
+      vars:
+        _eso_stores: "{{ _case.stores | map(attribute='name') | map('community.general.dict_kv', 'name') | list }}"
+        _eso_server: https://openbao-active.openbao.svc:8200
+        _eso_auth_mount: kubernetes
+        _eso_audience: vault
+        _eso_openbao_namespace: openbao
+        _eso_ca_configmap: openbao-ca-bundle
+        _eso_external: false
+  rescue:
+    - name: "external_secrets | test | {{ _case.name }} | Record failure"
+      ansible.builtin.set_fact:
+        _sa_failed: true
+        _sa_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "external_secrets | test | {{ _case.name }} | Assert the result"
+  ansible.builtin.assert:
+    that:
+      - (_sa_failed | bool) == (_case.expect | length > 0)
+      - _case.expect | length == 0 or _case.expect in _sa_msg
+    fail_msg: "{{ _case.name }}: expected failure /{{ _case.expect }}/, got failed={{ _sa_failed }}: {{ _sa_msg }}"
+    quiet: true

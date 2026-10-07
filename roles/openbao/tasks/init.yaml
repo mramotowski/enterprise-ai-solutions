@@ -1,0 +1,207 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — Init, unseal, bootstrap and root revoke (openbao_mode: internal)
+#
+# Included by install.yaml once the server pods are Running. One in-pod script
+# (files/bootstrap.sh, run in pod 0) does everything; the root token never
+# leaves it and is revoked on its exit. Only the unseal shares come back: they
+# go straight to the controller's terminal (never stdout) and the run waits
+# until the operator confirms them.
+#
+#   uninitialized          init, unseal all pods, bootstrap, revoke, show shares
+#   initialized, unsealed  no-op; fails if a bootstrap marker is missing
+#   initialized, sealed    fails with per-pod unseal instructions
+#   mixed pod states       fails with instructions
+# Runbook: docs/deploy/openbao.md.
+
+- name: "openbao | init | Read state"
+  ansible.builtin.include_tasks: bootstrap_exec.yaml
+  vars:
+    _openbao_bootstrap_mode: status
+
+- name: "openbao | init | Fail on a state the installer must not touch"
+  ansible.builtin.include_tasks: state_fail.yaml
+  when: _openbao_bs.state != 'uninitialized'
+
+- name: "openbao | init | Already initialized and bootstrapped"
+  ansible.builtin.debug:
+    msg: "OpenBao is initialized, unsealed and bootstrapped; nothing to do."
+  when: _openbao_bs.state == 'ok'
+
+# Pinned before the block: a block's when is re-evaluated for every task in it,
+# and the init run below changes _openbao_bs.state.
+- name: "openbao | init | Decide whether to initialize"
+  ansible.builtin.set_fact:
+    _openbao_needs_init: "{{ _openbao_bs.state == 'uninitialized' }}"
+
+- name: "openbao | init | Initialize"
+  when: _openbao_needs_init | bool
+  block:
+    - name: "openbao | init | Preflight (terminal, logging)"
+      ansible.builtin.include_tasks: tty_preflight.yaml
+
+    - name: "openbao | init | Init, unseal, bootstrap, revoke root"
+      ansible.builtin.include_tasks: bootstrap_exec.yaml
+      vars:
+        _openbao_bootstrap_mode: init
+
+    # The shares (or, if the result could not be parsed, the raw output that may
+    # hold them) exist only in this run: show them before reporting anything.
+    - name: "openbao | init | Decide what to show"
+      ansible.builtin.set_fact:
+        _openbao_show_shares: "{{ (_openbao_bs_has_shares | bool) or (_openbao_bs_raw_unparsed | bool) }}"
+        _openbao_confirm_failed: false
+        _openbao_confirm_error: ""
+
+    - name: "openbao | init | Show the unseal shares and wait for confirmation"
+      when: _openbao_show_shares | bool
+      block:
+        # stdin, not argv; pipelining keeps the module payload off disk. Workers
+        # have no controlling terminal (/dev/tty fails), so write to the device
+        # of the controller's terminal resolved by the preflight.
+        - name: "openbao | init | Write the unseal shares to the terminal"
+          vars:
+            ansible_pipelining: true
+            _shares: >-
+              {{ ((_openbao_bootstrap.stdout | trim).splitlines() | last | from_json).shares
+                 if _openbao_bs_has_shares | bool else [] }}
+          ansible.builtin.shell:
+            cmd: 'cat > "$OPENBAO_TTY"'
+            stdin: |-
+
+              ==================== OpenBao unseal shares ====================
+              {% if _openbao_bs_has_shares | bool %}
+              OpenBao in namespace '{{ openbao_namespace }}' was initialized ({{ _openbao_cluster_id }}).
+              Any {{ openbao_key_threshold }} of these {{ _shares | length }} shares unseal it. They are shown
+              only this once and are needed after every pod restart, upgrade and
+              restore. Store each share separately and safely (e.g. one per key holder).
+
+              {% for s in _shares %}
+                Unseal share {{ loop.index }}: {{ s }}
+              {% endfor %}
+              {% else %}
+              The init result could not be parsed. Raw bootstrap.sh output follows; if it
+              contains "unseal_keys" or "shares", those are your unseal shares: store them.
+
+              {{ _openbao_bootstrap.stdout | default('') }}
+              {% endif %}
+
+              ===============================================================
+          environment:
+            OPENBAO_TTY: "{{ _openbao_tty_dev }}"
+          register: _openbao_tty_write
+          changed_when: true
+          failed_when: false
+          no_log: true
+
+        - name: "openbao | init | Shares could not be shown"
+          ansible.builtin.fail:
+            msg: "the unseal shares could not be written to the terminal {{ _openbao_tty_dev | default('?') }} (rc={{ _openbao_tty_write.rc | default('?') }})"
+          when: _openbao_tty_write.rc | default(1) != 0
+
+        - name: "openbao | init | Confirm the unseal shares are saved"
+          ansible.builtin.pause:
+            prompt: >-
+              OpenBao unseal shares are shown above (on the terminal only, not in the log).
+              Type 'saved' once all {{ openbao_key_shares }} are stored safely
+          register: _openbao_confirm
+          until: (_openbao_confirm.user_input | default('') | trim | lower) == 'saved'
+          retries: 20
+          delay: 0
+      rescue:
+        - name: "openbao | init | Record the failed confirmation"
+          ansible.builtin.set_fact:
+            _openbao_confirm_failed: true
+            _openbao_confirm_error: "{{ ansible_failed_result.msg | default('not confirmed') | truncate(200) }}"
+      always:
+        # Clear the screen and scrollback so the shares do not linger on the
+        # terminal (tmux/screen/script keep their own scrollback: clear it there).
+        - name: "openbao | init | Clear the terminal"
+          ansible.builtin.shell:
+            cmd: "printf '\\033[3J\\033[H\\033[2J' > \"$OPENBAO_TTY\""
+          environment:
+            OPENBAO_TTY: "{{ _openbao_tty_dev }}"
+          register: _openbao_tty_clear
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | init | Terminal could not be cleared"
+          ansible.builtin.debug:
+            msg: >-
+              WARNING: the terminal {{ _openbao_tty_dev | default('?') }} could not be cleared
+              (rc={{ _openbao_tty_clear.rc | default('?') }}): clear the screen and scrollback
+              yourself so the unseal shares do not stay visible.
+          when: _openbao_tty_clear.rc | default(1) != 0
+
+    # Drop the raw result (the only copy of the shares in Ansible's memory).
+    - name: "openbao | init | Forget the raw init result"
+      ansible.builtin.set_fact:
+        _openbao_bootstrap: {}
+      no_log: true
+
+    # Every problem is reported, whatever happened to the confirmation.
+    - name: "openbao | init | Collect problems"
+      vars:
+        _init: "{{ _openbao_bs.state == 'initialized' }}"
+        _sealed: "{{ (_openbao_bs.sealed_pods | default('') | string).split() | map('regex_replace', '^', openbao_fullname ~ '-') | list }}"
+        _p_tty: >-
+          The unseal shares could not be written to the terminal {{ _openbao_tty_dev | default('?') }} (rc={{ _openbao_tty_write.rc | default('?') }}):
+          they are not recoverable. Delete OpenBao with its data and install again:
+          ./es_auto_installer.sh teardown openbao --env {{ env_name | default('<env>') }} -- -e openbao_teardown_delete_data=true,
+          then ./es_auto_installer.sh install platform --env {{ env_name | default('<env>') }}
+          (docs/deploy/openbao.md, "Lost unseal shares").
+        _p_confirm: >-
+          The unseal shares were shown on the terminal but saving them was not confirmed
+          ({{ _openbao_confirm_error }}). If they were not stored, they are lost: see
+          docs/deploy/openbao.md, "Lost unseal shares".
+        _p_root: >-
+          The root token may still be valid (revoke failed or the token could not be read;
+          stage '{{ _openbao_bs.stage | default('') }}': {{ _openbao_bs.error | default('') }}).
+          Follow the generate-root/revoke runbook (docs/deploy/openbao.md, "Revoke a leftover
+          root token") now.
+        _p_boot: >-
+          The bootstrap failed at '{{ _openbao_bs.stage | default('') }}': {{ _openbao_bs.error | default('') }}.
+          Fix the cause, then complete the bootstrap with a temporary root token: mint it in pod
+          {{ openbao_fullname }}-0 (docs/deploy/openbao.md, "Change the bootstrap (generate-root)",
+          steps 1-3), then in that shell: printf '%s\n' "$BAO_TOKEN" | {{ _openbao_bootstrap_apply_cmd }}
+          {{ '' if _openbao_bs_has_shares | bool else 'No unseal shares were returned: they are lost; see "Lost unseal shares".' }}
+        _p_sealed: >-
+          {{ _sealed | join(', ') }} did not unseal within {{ openbao_init_timeout }}s. Unseal each with the
+          saved shares: {% for p in _sealed %}kubectl -n {{ openbao_namespace }} exec -ti {{ p }} -c openbao --
+          bao operator unseal (run it {{ openbao_key_threshold }} times){{ '; ' if not loop.last else '' }}{% endfor %},
+          then re-run the install (docs/deploy/openbao.md, "Unseal after a restart").
+      ansible.builtin.set_fact:
+        _openbao_init_problems: >-
+          {{ ([_p_tty] if (_openbao_show_shares | bool) and (_openbao_tty_write.rc | default(1)) != 0 else [])
+             + ([_p_confirm] if (_openbao_confirm_failed | bool) and (_openbao_tty_write.rc | default(1)) == 0 else [])
+             + ([_p_root] if _init and not (_openbao_bs.root_revoked | default(false) | bool) else [])
+             + ([_p_boot] if _init and not (_openbao_bs.bootstrap_ok | default(false) | bool) else [])
+             + ([_p_sealed] if _init and _sealed | length > 0 else []) }}
+
+    - name: "openbao | init | Init problems"
+      ansible.builtin.fail:
+        msg: "OpenBao init: {{ _openbao_init_problems | join(' ') }}"
+      when: _openbao_init_problems | length > 0
+
+    # Not an init result (exec broke, init failed, concurrent init, ...).
+    - name: "openbao | init | Unexpected init result"
+      ansible.builtin.include_tasks: state_fail.yaml
+      when: _openbao_bs.state not in ['initialized', 'ok']
+
+    - name: "openbao | init | Unexpected state ok after init"
+      ansible.builtin.fail:
+        msg: >-
+          Unexpected state: the init run found OpenBao already initialized and bootstrapped,
+          although the status run just before saw it uninitialized. Another run initialized it
+          and holds the unseal shares; this run changed nothing.
+      when: _openbao_bs.state == 'ok'
+
+    - name: "openbao | init | Done"
+      ansible.builtin.debug:
+        msg: >-
+          OpenBao initialized, unsealed ({{ openbao_replicas }} pod(s)) and bootstrapped:
+          KV v2 '{{ openbao_kv_mount }}', auth/kubernetes, roles for {{ openbao_layers | join(', ') }},
+          operator and backup, file audit device to stdout. Root token revoked
+          (accessor {{ _openbao_bs.root_accessor | default('?') }}).

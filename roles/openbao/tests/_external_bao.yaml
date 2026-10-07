@@ -1,0 +1,30 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One root-token shell command in a test container (external_test.yaml).
+# Input: _bao {container, cmd, env (optional)}. The root token goes in on
+# stdin, never in argv. Output: _bao_rc, _bao_out, _bao_err (no token in them:
+# the commands never print one unless the caller asks for -field=token, and
+# then the caller keeps the result under no_log).
+
+- name: "openbao | external test | bao in {{ _bao.container }}"
+  vars:
+    _env: "{{ _bao.env | default({}) }}"
+    _env_args: >-
+      {% set r = [] %}{% for k, v in _env.items() %}{% set _ = r.extend(['-e', k ~ '=' ~ v]) %}{% endfor %}{{ r }}
+  ansible.builtin.command:
+    argv: "{{ ['docker', 'exec', '-i'] + _env_args + [_bao.container, '/bin/sh', '-c', 'read -r BAO_TOKEN; export BAO_TOKEN; ' ~ _bao.cmd] }}"
+    stdin: "{{ _roots[_bao.container] }}"
+  register: _bao_raw
+  changed_when: true
+  failed_when: false
+  no_log: true
+
+- name: "openbao | external test | Keep the bao result"
+  ansible.builtin.set_fact:
+    _bao_rc: "{{ _bao_raw.rc }}"
+    _bao_out: "{{ _bao_raw.stdout | default('') }}"
+    _bao_err: "{{ _bao_raw.stderr | default('') }}"
+    _bao_raw: {}
+  no_log: true

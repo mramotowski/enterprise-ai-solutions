@@ -1,0 +1,39 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# One replicas_guard.yaml case of render_test.yaml
+# (_case: {name, current (null = no StatefulSet), replicas, peers_removed?, expect_fail, removed, expect?}).
+
+- name: "openbao | test | guard {{ _case.name }} | Reset"
+  ansible.builtin.set_fact:
+    _g_failed: false
+    _g_msg: ""
+
+- name: "openbao | test | guard {{ _case.name }} | Run replicas_guard.yaml"
+  block:
+    - name: "openbao | test | guard {{ _case.name }} | Include"
+      ansible.builtin.include_role:
+        name: "{{ _role_dir }}"
+        tasks_from: replicas_guard.yaml
+        public: true
+      vars:
+        openbao_replicas: "{{ _case.replicas }}"
+        openbao_raft_peers_removed: "{{ _case.peers_removed | default(false) }}"
+        _openbao_sts_before:
+          resources: "{{ [] if _case.current is none else [{'spec': {'replicas': _case.current}}] }}"
+  rescue:
+    - name: "openbao | test | guard {{ _case.name }} | Record"
+      ansible.builtin.set_fact:
+        _g_failed: true
+        _g_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "openbao | test | guard {{ _case.name }} | Assert"
+  ansible.builtin.assert:
+    that:
+      - _g_failed == _case.expect_fail
+      - not _case.expect_fail or _g_msg is search(_case.expect)
+      - _openbao_removed_ordinals | map('int') | list == _case.removed
+      - (_openbao_current_replicas | int) == (_case.current | default(0, true) | int)
+    fail_msg: "guard {{ _case.name }}: failed={{ _g_failed }} removed={{ _openbao_removed_ordinals | default('?') }} msg={{ _g_msg }}"
+    quiet: true

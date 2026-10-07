@@ -1,0 +1,33 @@
+# serviceaccounts/token create, restricted by resourceNames to the controller's
+# own ServiceAccount (the chart's cluster-wide grant is off). The openbao-<layer>
+# ClusterSecretStores request tokens for this ServiceAccount only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ (external_secrets_helm_release_name ~ '-own-token') | to_json }}
+  namespace: {{ external_secrets_namespace | to_json }}
+  labels:
+    app.kubernetes.io/name: external-secrets
+    app.kubernetes.io/managed-by: ai-solutions-installer
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    resourceNames: [{{ external_secrets_service_account_name | to_json }}]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ (external_secrets_helm_release_name ~ '-own-token') | to_json }}
+  namespace: {{ external_secrets_namespace | to_json }}
+  labels:
+    app.kubernetes.io/name: external-secrets
+    app.kubernetes.io/managed-by: ai-solutions-installer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ (external_secrets_helm_release_name ~ '-own-token') | to_json }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ external_secrets_service_account_name | to_json }}
+    namespace: {{ external_secrets_namespace | to_json }}

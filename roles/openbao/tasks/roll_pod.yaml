@@ -1,0 +1,107 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — restart (delete) one server pod if asked, wait until it runs the
+# current revision, pause for the operator to unseal it, and wait until it
+# reports unsealed and joined. Included by rollout.yaml.
+# Input: _openbao_roll_pod {name, delete}, _openbao_sts (updateRevision).
+
+- name: "openbao | rollout | {{ _openbao_roll_pod.name }} | Current pod"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    name: "{{ _openbao_roll_pod.name }}"
+    namespace: "{{ openbao_namespace }}"
+  register: _openbao_roll_before
+
+# No wait on the delete: the StatefulSet recreates a pod of the same name at
+# once, so "gone" may never be observed. The next task waits for a new uid.
+- name: "openbao | rollout | {{ _openbao_roll_pod.name }} | Delete (OnDelete: the StatefulSet recreates it)"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Pod
+    name: "{{ _openbao_roll_pod.name }}"
+    namespace: "{{ openbao_namespace }}"
+  when: _openbao_roll_pod.delete | bool
+
+- name: "openbao | rollout | {{ _openbao_roll_pod.name }} | Wait for it to run the current revision"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    name: "{{ _openbao_roll_pod.name }}"
+    namespace: "{{ openbao_namespace }}"
+  register: _openbao_roll_p
+  until:
+    - _openbao_roll_p.resources | default([]) | length == 1
+    - not (_openbao_roll_pod.delete | bool)
+      or _openbao_roll_p.resources[0].metadata.uid != (_openbao_roll_before.resources | default([{}]) | first).metadata.uid | default('')
+    - (_openbao_roll_p.resources[0].status.phase | default('')) == 'Running'
+    - (_openbao_roll_p.resources[0].metadata.labels | default({})).get('controller-revision-hash', '')
+      == _openbao_sts.resources[0].status.updateRevision
+    - _openbao_roll_p.resources[0].status.containerStatuses | default([])
+      | selectattr('name', 'eq', 'openbao') | selectattr('state.running', 'defined') | list | length == 1
+  retries: "{{ openbao_pods_wait_retries }}"
+  delay: "{{ openbao_pods_wait_delay }}"
+
+- name: "openbao | rollout | {{ _openbao_roll_pod.name }} | Unseal it now"
+  vars:
+    _cmd: "kubectl -n {{ openbao_namespace }} exec -ti {{ _openbao_roll_pod.name }} -c openbao -- bao operator unseal"
+  ansible.builtin.pause:
+    prompt: |-
+
+      ==================== OpenBao: unseal {{ _openbao_roll_pod.name }} ====================
+      {{ _openbao_roll_pod.name }} {{ 'was restarted on the new revision' if _openbao_roll_pod.delete else 'is new (scale-up)' }} and is sealed{{ '' if _openbao_roll_pod.delete else '; unsealing it joins it to the Raft cluster' }}.
+      In another terminal, run this {{ openbao_key_threshold }} times, one unseal share each
+      (the prompt hides what you type):
+
+        {{ _cmd }}
+
+      Then press Enter here. The run waits up to {{ (openbao_upgrade_unseal_retries | int) * (openbao_upgrade_unseal_delay | int) }}s for the pod to report unsealed.
+      ======================================================================
+
+- name: "openbao | rollout | {{ _openbao_roll_pod.name }} | Wait until unsealed and joined"
+  kubernetes.core.k8s_exec:
+    namespace: "{{ openbao_namespace }}"
+    pod: "{{ _openbao_roll_pod.name }}"
+    container: openbao
+    command: "bao status -format=json"
+  register: _openbao_roll_status
+  vars:
+    _st: "{{ (_openbao_roll_status.stdout | default('') | trim) | from_json if (_openbao_roll_status.stdout | default('') | trim).startswith('{') else {} }}"
+  until:
+    - _st.sealed is defined
+    - not (_st.sealed | bool)
+    # A standby (or the new leader) knows the active node once it has joined,
+    # and has applied the log up to the commit index it learned from the leader
+    # (otherwise restarting the next pod could leave too few healthy voters).
+    - not (_st.ha_enabled | default(false) | bool) or (_st.leader_address | default('') | length > 0)
+    - (_st.raft_committed_index | default(0) | int) > 0
+    - (_st.raft_applied_index | default(0) | int) >= (_st.raft_committed_index | default(0) | int)
+  retries: "{{ openbao_upgrade_unseal_retries }}"
+  delay: "{{ openbao_upgrade_unseal_delay }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "openbao | rollout | {{ _openbao_roll_pod.name }} | Assert unsealed"
+  vars:
+    _out: "{{ _openbao_roll_status.stdout | default('') | trim }}"
+    _st: "{{ _out | from_json if _out.startswith('{') else {} }}"
+  ansible.builtin.assert:
+    that:
+      - _st.sealed is defined
+      - not (_st.sealed | bool)
+      - not (_st.ha_enabled | default(false) | bool) or (_st.leader_address | default('') | length > 0)
+      - (_st.raft_committed_index | default(0) | int) > 0
+      - (_st.raft_applied_index | default(0) | int) >= (_st.raft_committed_index | default(0) | int)
+    fail_msg: >-
+      {{ _openbao_roll_pod.name }} is still {{ 'sealed' if (_st.sealed | default(true)) else 'not joined or catching up (leader '
+      ~ (_st.leader_address | default('none')) ~ ', applied ' ~ (_st.raft_applied_index | default('?')) ~ ' of '
+      ~ (_st.raft_committed_index | default('?')) ~ ')' }}
+      (unseal progress {{ _st.progress | default('?') }}/{{ _st.t | default(openbao_key_threshold) }}).
+      Unseal it: kubectl -n {{ openbao_namespace }} exec -ti {{ _openbao_roll_pod.name }} -c openbao --
+      bao operator unseal (run it {{ openbao_key_threshold }} times), then re-run the upgrade; the pods
+      already done are skipped (docs/deploy/openbao.md, "Upgrades").
+    success_msg: "{{ _openbao_roll_pod.name }} unsealed{{ ', active' if _st.is_self | default(false) else ', standby' }}"

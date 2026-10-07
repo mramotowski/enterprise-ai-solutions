@@ -1,0 +1,564 @@
+---
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# openbao — local proof of files/tls-reload.sh and files/snapshot.sh (no cluster).
+#
+# Server: quay.io/openbao/openbao:2.7.0 in Docker with a TLS listener (throwaway
+# CA, two server certs with SAN 127.0.0.1) and integrated Raft. Rows:
+#   tls check        the mounted leaf is served: current
+#   tls stale        tls.crt swapped (atomic rename, as the kubelet does): stale
+#   tls heal         reload-if-stale sends SIGHUP: reloaded, then current
+#   tls sidecar      `watch` in a second container sharing the server's PID and
+#                    network namespaces (the tls-reloader sidecar) heals a swap
+#   status fields    unsealed `bao status` has sealed/ha_enabled/leader_address
+#                    (what tasks/roll_pod.yaml waits for)
+#   snapshot save    snapshot.sh in a "Job" container (the caller's uid, so the
+#                    host can checksum the file; read-only root, /tmp tmpfs) logs in as role 'backup' and writes
+#                    openbao.snap + .sha256
+#   snapshot restore value changed after the save, restore brings it back,
+#                    OpenBao stays unsealed
+#   sha mismatch     a wrong .sha256 is refused, nothing restored
+#   bad login        a JWT for another audience fails at login
+#   other keyring    restore into a second OpenBao: restored, sealed; the first
+#                    server's unseal key unseals it with the restored data
+# Kubernetes TokenReview does not exist in Docker: a jwt auth method mounted at
+# auth/kubernetes stands in (same login request: role + jwt=@file; the JWT is
+# signed by files/make_jwt.sh). The test's own root tokens and unseal keys stay
+# inside the throwaway containers (/tmp) and are never printed.
+#
+# Run from the repo root:
+#   ansible-playbook -i localhost, -c local roles/openbao/tests/ops_test.yaml
+
+- name: "openbao | ops test"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role_dir: "{{ playbook_dir | dirname }}"
+    _image: "quay.io/openbao/openbao:2.7.0"
+    _scripts: "/openbao/userconfig/openbao-bootstrap"
+    # bao calls as the test's root token, inside a server container.
+    _as_root: "export BAO_TOKEN=$(cat /tmp/rt); "
+    _backup_policy: |
+      path "sys/storage/raft/snapshot" {
+        capabilities = ["read"]
+      }
+      path "sys/storage/raft/snapshot-force" {
+        capabilities = ["update"]
+      }
+  tasks:
+    - name: "openbao | ops test | Container name suffix"
+      ansible.builtin.set_fact:
+        _suffix: "{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_lowercase', 'digits'], length=8) }}"
+
+    - name: "openbao | ops test | Container names"
+      ansible.builtin.set_fact:
+        _s1: "openbao-ops-test-{{ _suffix }}-1"
+        _s2: "openbao-ops-test-{{ _suffix }}-2"
+        _side: "openbao-ops-test-{{ _suffix }}-reloader"
+
+    - name: "openbao | ops test | Create temp dir"
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: openbao-ops-
+      register: _tmp
+
+    - name: "openbao | ops test | Run"
+      block:
+        - name: "openbao | ops test | Directories"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}/{{ item.d }}"
+            state: directory
+            mode: "{{ item.m }}"
+          loop:
+            - {d: cfg, m: "0755"}
+            - {d: tls, m: "0755"}
+            - {d: pki, m: "0700"}
+            - {d: jwt, m: "0755"}
+            - {d: snap, m: "0777"}
+
+        - name: "openbao | ops test | Throwaway CA, two server certs, JWT signing key"
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              cd {{ (_tmp.path ~ '/pki') | quote }}
+              openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout ca.key -out ca.crt -subj /CN=ops-test-ca -days 1 2>/dev/null
+              printf 'subjectAltName=IP:127.0.0.1\n' > ext
+              openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout ca2.key -out ca2.crt -subj /CN=ops-test-ca2 -days 1 2>/dev/null
+              openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout c.key -out c.csr -subj /CN=ops-test-c 2>/dev/null
+              openssl x509 -req -in c.csr -CA ca2.crt -CAkey ca2.key -CAcreateserial -out c.leaf -days 1 -extfile ext 2>/dev/null
+              cat c.leaf ca2.crt > c.crt
+              for c in a b; do
+                openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout $c.key -out $c.csr -subj /CN=ops-test-$c 2>/dev/null
+                openssl x509 -req -in $c.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out $c.leaf -days 1 -extfile ext 2>/dev/null
+                # cert-manager style: leaf first, then the CA.
+                cat $c.leaf ca.crt > $c.crt
+              done
+              openssl genrsa -out jwt.key 2048 2>/dev/null
+              openssl rsa -in jwt.key -pubout -out ../jwt/pub.pem 2>/dev/null
+              cp ca.crt ../tls/ca.crt; cp a.crt ../tls/tls.crt; cp a.key ../tls/tls.key
+              chmod 0644 ../tls/* ../jwt/pub.pem
+          changed_when: true
+
+        - name: "openbao | ops test | Service-account-like JWTs (good, wrong audience)"
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              h={{ (playbook_dir ~ '/files/make_jwt.sh') | quote }}
+              d={{ _tmp.path | quote }}
+              sh "$h" "$d/pki/jwt.key" vault system:serviceaccount:openbao-backup:openbao-snapshot > "$d/jwt/token"
+              mkdir -p "$d/jwt-bad"
+              sh "$h" "$d/pki/jwt.key" not-vault system:serviceaccount:openbao-backup:openbao-snapshot > "$d/jwt-bad/token"
+              chmod 0755 "$d/jwt-bad"; chmod 0644 "$d/jwt/token" "$d/jwt-bad/token"
+          changed_when: true
+
+        - name: "openbao | ops test | Server config"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/cfg/server.hcl"
+            mode: "0644"
+            content: |
+              storage "raft" {
+                path    = "/openbao/data"
+                node_id = "ops-0"
+              }
+              listener "tcp" {
+                address       = "127.0.0.1:8200"
+                tls_cert_file = "/tls/tls.crt"
+                tls_key_file  = "/tls/tls.key"
+                disable_unauthed_generate_root_endpoints = false
+              }
+              api_addr      = "https://127.0.0.1:8200"
+              cluster_addr  = "https://127.0.0.1:8201"
+              disable_mlock = true
+              audit "file" "file" {
+                options {
+                  file_path = "stdout"
+                }
+              }
+
+        - name: "openbao | ops test | Start two servers"
+          ansible.builtin.command:
+            argv: [docker, run, -d, --name, "{{ item }}", -e, SKIP_SETCAP=true,
+                   -e, "BAO_ADDR=https://127.0.0.1:8200", -e, BAO_CACERT=/tls/ca.crt,
+                   -v, "{{ _tmp.path }}/cfg:/openbao/config:ro", -v, "{{ _tmp.path }}/tls:/tls:ro",
+                   -v, "{{ _tmp.path }}/jwt:/jwt:ro",
+                   -v, "{{ _role_dir }}/files:{{ _scripts }}:ro", "{{ _image }}", server]
+          loop: ["{{ _s1 }}", "{{ _s2 }}"]
+          changed_when: true
+
+        - name: "openbao | ops test | Wait for both servers (sealed answers rc 2)"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ item }}", bao, status]
+          loop: ["{{ _s1 }}", "{{ _s2 }}"]
+          register: _up
+          until: _up.rc == 2
+          retries: 30
+          delay: 1
+          changed_when: false
+          failed_when: false
+
+        # ── TLS reload ──────────────────────────────────────────────────────
+        - name: "openbao | ops test | tls check (current)"
+          ansible.builtin.command:
+            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", check]
+          register: _t1
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | ops test | Swap tls.crt/tls.key to cert b (atomic rename)"
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              cd {{ _tmp.path | quote }}
+              cp pki/b.crt tls/.n.crt; cp pki/b.key tls/.n.key; chmod 0644 tls/.n.*
+              mv tls/.n.key tls/tls.key; mv tls/.n.crt tls/tls.crt
+          changed_when: true
+
+        - name: "openbao | ops test | tls check after the swap (stale)"
+          ansible.builtin.command:
+            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", check]
+          register: _t2
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | ops test | reload-if-stale"
+          ansible.builtin.command:
+            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", reload-if-stale]
+          register: _t3
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | ops test | tls check after the reload (current)"
+          ansible.builtin.command:
+            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", check]
+          register: _t4
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | ops test | Assert check / stale / reload"
+          ansible.builtin.assert:
+            that:
+              - _t1.rc == 0 and _t1.stdout == 'current'
+              - _t2.rc == 1 and _t2.stdout == 'stale'
+              - _t3.rc == 0 and _t3.stdout == 'reloaded'
+              - _t4.rc == 0 and _t4.stdout == 'current'
+            fail_msg: "{{ [_t1, _t2, _t3, _t4] | map(attribute='stdout') | list }} / {{ [_t1, _t2, _t3, _t4] | map(attribute='stderr') | list }}"
+            quiet: true
+
+        # A served certificate the mounted CA does not trust (rotated CA, or
+        # expired): still a server that answers, so stale, and reloaded.
+        - name: "openbao | ops test | Serve cert c (other CA), then mount a and b's CA bundle back"
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              cd {{ _tmp.path | quote }}
+              cp pki/c.crt tls/.n.crt; cp pki/c.key tls/.n.key; chmod 0644 tls/.n.*
+              mv tls/.n.key tls/tls.key; mv tls/.n.crt tls/tls.crt
+              docker exec -e OB_TLS_DIR=/tls {{ _s1 | quote }} /bin/sh {{ (_scripts ~ '/tls-reload.sh') | quote }} reload-if-stale
+              cp pki/b.crt tls/.n.crt; cp pki/b.key tls/.n.key; chmod 0644 tls/.n.*
+              mv tls/.n.key tls/tls.key; mv tls/.n.crt tls/tls.crt
+              docker exec -e OB_TLS_DIR=/tls {{ _s1 | quote }} /bin/sh {{ (_scripts ~ '/tls-reload.sh') | quote }} check || true
+              docker exec -e OB_TLS_DIR=/tls {{ _s1 | quote }} /bin/sh {{ (_scripts ~ '/tls-reload.sh') | quote }} reload-if-stale
+          register: _tca
+          changed_when: true
+
+        - name: "openbao | ops test | tls check with a certificate from a rotated CA"
+          ansible.builtin.assert:
+            that:
+              # c is served after the first reload; with b mounted (the CA that does not
+              # sign c), c is stale, not unreachable, and the reload fixes it.
+              - _tca.stdout_lines == ['reloaded', 'stale', 'reloaded']
+            fail_msg: "{{ _tca.stdout_lines }} {{ _tca.stderr }}"
+            quiet: true
+
+        - name: "openbao | ops test | Start the reloader sidecar (shared PID and network namespace)"
+          ansible.builtin.command:
+            argv: [docker, run, -d, --name, "{{ _side }}", --pid, "container:{{ _s1 }}", --network, "container:{{ _s1 }}",
+                   --user, "100:1000", --read-only, --tmpfs, /tmp, --cap-drop, ALL, --security-opt, no-new-privileges,
+                   -e, OB_TLS_DIR=/tls, -e, OB_TLS_INTERVAL=5, -e, HOME=/tmp,
+                   -v, "{{ _tmp.path }}/tls:/tls:ro", -v, "{{ _role_dir }}/files:{{ _scripts }}:ro",
+                   --entrypoint, /bin/sh, "{{ _image }}", "{{ _scripts }}/tls-reload.sh", watch]
+          changed_when: true
+
+        - name: "openbao | ops test | Swap back to cert a"
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              cd {{ _tmp.path | quote }}
+              cp pki/a.crt tls/.n.crt; cp pki/a.key tls/.n.key; chmod 0644 tls/.n.*
+              mv tls/.n.key tls/tls.key; mv tls/.n.crt tls/tls.crt
+          changed_when: true
+
+        - name: "openbao | ops test | Wait for the sidecar to reload"
+          ansible.builtin.command:
+            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", check]
+          register: _t5
+          until: _t5.stdout == 'current'
+          retries: 15
+          delay: 2
+          changed_when: false
+          failed_when: false
+
+        # The sidecar logs once it has confirmed the reload (up to a second later).
+        - name: "openbao | ops test | Sidecar log"
+          ansible.builtin.command:
+            argv: [docker, logs, "{{ _side }}"]
+          register: _side_log
+          until: _side_log.stderr is search('now serves the mounted one')
+          retries: 10
+          delay: 1
+          changed_when: false
+
+        - name: "openbao | ops test | Assert the sidecar healed the swap"
+          ansible.builtin.assert:
+            that:
+              - _t5.stdout == 'current'
+              - _side_log.stderr is search('sent SIGHUP to [0-9]+ and it now serves the mounted one')
+            fail_msg: "check={{ _t5.stdout }} sidecar: {{ _side_log.stderr }}"
+            quiet: true
+
+        - name: "openbao | ops test | Stop the sidecar"
+          ansible.builtin.command:
+            argv: [docker, rm, -f, "{{ _side }}"]
+          changed_when: true
+
+        # ── Init both servers (test-only root tokens stay in the containers) ─
+        - name: "openbao | ops test | Init, unseal, KV, backup policy, jwt auth at auth/kubernetes"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ item }}"
+              - /bin/sh
+              - -c
+              - |
+                set -eu
+                umask 077
+                bao operator init -key-shares=1 -key-threshold=1 -format=json | tr -d ' \n' > /tmp/init.json
+                sed -n 's/.*"unseal_keys_b64":\["\([^"]*\)".*/\1/p' /tmp/init.json > /tmp/k
+                sed -n 's/.*"root_token":"\([^"]*\)".*/\1/p' /tmp/init.json > /tmp/rt
+                rm -f /tmp/init.json
+                bao write sys/unseal key=- < /tmp/k > /dev/null
+                i=0; until bao read -format=json sys/leader 2>/dev/null | tr -d ' \n' | grep -q '"is_self":true'; do i=$((i+1)); [ $i -lt 30 ] || exit 1; sleep 1; done
+                {{ _as_root }}
+                bao secrets enable -path=intel-ai -version=2 kv > /dev/null
+                bao kv put intel-ai/test-cluster/erag/probe v=one > /dev/null
+                printf '%s' '{{ _backup_policy }}' | bao policy write backup - > /dev/null
+                bao auth enable -path=kubernetes jwt > /dev/null
+                bao write auth/kubernetes/config jwt_validation_pubkeys=@/jwt/pub.pem > /dev/null
+                bao write auth/kubernetes/role/backup role_type=jwt bound_audiences=vault user_claim=sub \
+                  bound_subject=system:serviceaccount:openbao-backup:openbao-snapshot token_policies=backup token_ttl=10m > /dev/null
+                echo ready
+          loop: ["{{ _s1 }}", "{{ _s2 }}"]
+          register: _init
+          changed_when: true
+          failed_when: false
+          no_log: true
+
+        - name: "openbao | ops test | Assert both servers ready"
+          ansible.builtin.assert:
+            that:
+              - _init.results | map(attribute='stdout') | list == ['ready', 'ready']
+            # stderr is bao's error text (no token or key is ever echoed).
+            fail_msg: "init rc: {{ _init.results | map(attribute='rc') | list }} {{ _init.results | map(attribute='stderr') | map('truncate', 300) | list }}"
+            quiet: true
+
+        - name: "openbao | ops test | Unsealed status fields (roll_pod.yaml waits for them)"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ _s1 }}", bao, status, -format=json]
+          register: _st
+          changed_when: false
+
+        - name: "openbao | ops test | Assert status fields"
+          vars:
+            _j: "{{ _st.stdout | from_json }}"
+          ansible.builtin.assert:
+            that:
+              - _j.sealed == false
+              - _j.ha_enabled
+              - _j.leader_address | length > 0
+              - _j.is_self is defined
+              - _j.raft_committed_index | int > 0
+              - _j.raft_applied_index | int >= _j.raft_committed_index | int
+            fail_msg: "{{ _st.stdout }}"
+            quiet: true
+
+        # ── Snapshot ────────────────────────────────────────────────────────
+        - name: "openbao | ops test | Snapshot job run"
+          ansible.builtin.set_fact:
+            _job_argv: >-
+              {{ ['docker', 'run', '--rm', '--user', lookup('ansible.builtin.pipe', 'id -u') ~ ':1000', '--read-only', '--tmpfs', '/tmp',
+                  '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+                  '-e', 'BAO_ADDR=https://127.0.0.1:8200', '-e', 'BAO_CACERT=/ca/ca.crt', '-e', 'HOME=/tmp',
+                  '-e', 'OB_AUTH_MOUNT=kubernetes', '-e', 'OB_ROLE=backup',
+                  '-e', 'OB_JWT_FILE=/var/run/secrets/openbao/token', '-e', 'OB_SNAPSHOT_DIR=/snapshots',
+                  '-v', _role_dir ~ '/files:/scripts:ro', '-v', _tmp.path ~ '/tls:/ca:ro',
+                  '-v', _tmp.path ~ '/snap:/snapshots', '--entrypoint', '/bin/sh'] }}
+
+        - name: "openbao | ops test | snapshot save"
+          ansible.builtin.command:
+            argv: "{{ _job_argv + ['-v', _tmp.path ~ '/jwt:/var/run/secrets/openbao:ro', '--network', 'container:' ~ _s1, _image, '/scripts/snapshot.sh', 'save'] }}"
+          register: _save
+          changed_when: true
+          failed_when: false
+
+        - name: "openbao | ops test | Snapshot file checksum on the host"
+          ansible.builtin.stat:
+            path: "{{ _tmp.path }}/snap/{{ (_save.stdout_lines | last | from_json).file | default('none') }}"
+            checksum_algorithm: sha256
+          register: _snapfile
+
+        - name: "openbao | ops test | Assert saved"
+          vars:
+            _r: "{{ _save.stdout_lines | last | from_json }}"
+          ansible.builtin.assert:
+            that:
+              - _save.rc == 0
+              - _r.result == 'saved'
+              - _r.sealed == false
+              - _r.bytes | int > 0
+              - _snapfile.stat.exists
+              - _snapfile.stat.checksum == _r.sha256
+              - _snapfile.stat.size == _r.bytes | int
+              - _r.file == 'openbao-' ~ _r.sha256 ~ '.snap'
+              - lookup('ansible.builtin.file', _tmp.path ~ '/snap/openbao.snap.sha256') == _r.sha256 ~ '  ' ~ _r.file
+              - _save.stdout_lines | length == 1
+              - (_save.stdout ~ _save.stderr) is not search('s\.[A-Za-z0-9]{20,}')
+            fail_msg: "rc={{ _save.rc }} {{ _save.stdout }} {{ _save.stderr }}"
+            quiet: true
+
+        # A second save replaces the pair: one snapshot file, the pointer names it.
+        - name: "openbao | ops test | snapshot save again"
+          ansible.builtin.command:
+            argv: "{{ _job_argv + ['-v', _tmp.path ~ '/jwt:/var/run/secrets/openbao:ro', '--network', 'container:' ~ _s1, _image, '/scripts/snapshot.sh', 'save'] }}"
+          register: _save2
+          changed_when: true
+          failed_when: false
+
+        - name: "openbao | ops test | Snapshot files after the second save"
+          ansible.builtin.find:
+            paths: "{{ _tmp.path }}/snap"
+            patterns: "*.snap*"
+            hidden: true
+          register: _snaps
+
+        - name: "openbao | ops test | Assert one snapshot, named by the pointer"
+          vars:
+            _r2: "{{ _save2.stdout_lines | last | from_json }}"
+            _names: "{{ _snaps.files | map(attribute='path') | map('basename') | sort }}"
+          ansible.builtin.assert:
+            that:
+              - _save2.rc == 0 and _r2.result == 'saved'
+              - _names == ([_r2.file, 'openbao.snap.sha256'] | sort)
+              - lookup('ansible.builtin.file', _tmp.path ~ '/snap/openbao.snap.sha256') == _r2.sha256 ~ '  ' ~ _r2.file
+            fail_msg: "{{ _names }} / {{ _save2.stdout }}"
+            quiet: true
+
+        - name: "openbao | ops test | Checksum of the current snapshot"
+          ansible.builtin.stat:
+            path: "{{ _tmp.path }}/snap/{{ (_save2.stdout_lines | last | from_json).file }}"
+            checksum_algorithm: sha256
+          register: _snapfile
+
+        - name: "openbao | ops test | Change the value after the snapshot"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ _s1 }}", /bin/sh, -c, "{{ _as_root }}bao kv put intel-ai/test-cluster/erag/probe v=two >/dev/null && bao kv get -field=v intel-ai/test-cluster/erag/probe"]
+          register: _v2
+          changed_when: true
+
+        - name: "openbao | ops test | snapshot restore"
+          ansible.builtin.command:
+            argv: "{{ _job_argv + ['-v', _tmp.path ~ '/jwt:/var/run/secrets/openbao:ro', '--network', 'container:' ~ _s1, _image, '/scripts/snapshot.sh', 'restore'] }}"
+          register: _rest
+          changed_when: true
+          failed_when: false
+
+        - name: "openbao | ops test | Value after the restore"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ _s1 }}", /bin/sh, -c, "{{ _as_root }}bao kv get -field=v intel-ai/test-cluster/erag/probe"]
+          register: _v3
+          until: _v3.rc == 0
+          retries: 10
+          delay: 1
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | ops test | Assert restored and still unsealed"
+          vars:
+            _r: "{{ _rest.stdout_lines | last | from_json }}"
+          ansible.builtin.assert:
+            that:
+              - _v2.stdout == 'two'
+              - _rest.rc == 0
+              - _r.result == 'restored'
+              - _r.sealed == false
+              - _r.sha256 == _snapfile.stat.checksum
+              - _v3.stdout == 'one'
+            fail_msg: "rc={{ _rest.rc }} {{ _rest.stdout }} {{ _rest.stderr }} value={{ _v3.stdout }}"
+            quiet: true
+
+        - name: "openbao | ops test | Corrupt the checksum file"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/snap/openbao.snap.sha256"
+            content: "0000000000000000000000000000000000000000000000000000000000000000  {{ _snapfile.stat.path | basename }}\n"
+            mode: "0644"
+
+        - name: "openbao | ops test | snapshot restore with a wrong checksum"
+          ansible.builtin.command:
+            argv: "{{ _job_argv + ['-v', _tmp.path ~ '/jwt:/var/run/secrets/openbao:ro', '--network', 'container:' ~ _s1, _image, '/scripts/snapshot.sh', 'restore'] }}"
+          register: _badsum
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | ops test | Restore the checksum file"
+          ansible.builtin.copy:
+            dest: "{{ _tmp.path }}/snap/openbao.snap.sha256"
+            content: "{{ _snapfile.stat.checksum }}  {{ _snapfile.stat.path | basename }}\n"
+            mode: "0644"
+
+        - name: "openbao | ops test | snapshot save with a JWT for another audience"
+          ansible.builtin.command:
+            argv: "{{ _job_argv + ['-v', _tmp.path ~ '/jwt-bad:/var/run/secrets/openbao:ro', '--network', 'container:' ~ _s1, _image, '/scripts/snapshot.sh', 'save'] }}"
+          register: _badlogin
+          changed_when: false
+          failed_when: false
+
+        - name: "openbao | ops test | Assert checksum and login failures"
+          vars:
+            _a: "{{ _badsum.stdout_lines | last | from_json }}"
+            _b: "{{ _badlogin.stdout_lines | last | from_json }}"
+          ansible.builtin.assert:
+            that:
+              - _badsum.rc == 1
+              - _a.result == 'failed' and _a.stage == 'check'
+              - _a.error is search('checksum mismatch.*refusing to restore')
+              - _badlogin.rc == 1
+              - _b.result == 'failed' and _b.stage == 'login'
+              - _b.error is search('login as role backup on auth/kubernetes failed')
+            fail_msg: "{{ _badsum.stdout }} / {{ _badlogin.stdout }}"
+            quiet: true
+
+        - name: "openbao | ops test | Snapshot restore into the other OpenBao (other keyring)"
+          ansible.builtin.command:
+            argv: "{{ _job_argv + ['-v', _tmp.path ~ '/jwt:/var/run/secrets/openbao:ro', '--network', 'container:' ~ _s2, _image, '/scripts/snapshot.sh', 'restore'] }}"
+          register: _cross
+          changed_when: true
+          failed_when: false
+
+        - name: "openbao | ops test | Unseal the other OpenBao with the first one's key, read the value"
+          ansible.builtin.shell:
+            executable: /bin/bash
+            cmd: >-
+              set -o pipefail; docker exec {{ _s1 | quote }} cat /tmp/k | docker exec -i {{ _s2 | quote }} /bin/sh -c
+              'cat > /tmp/k1; bao write sys/unseal key=- < /tmp/k1 >/dev/null; rm -f /tmp/k1;
+              i=0; until bao read -format=json sys/leader 2>/dev/null | tr -d " \n" | grep -q "\"is_self\":true"; do i=$((i+1)); [ $i -lt 30 ] || break; sleep 1; done;
+              BAO_TOKEN=$(cat /tmp/rt) bao token lookup >/dev/null 2>&1; echo "own_root_rc=$?";
+              bao status -format=json | tr -d " \n" | grep -q "\"sealed\":false" && echo unsealed'
+          register: _cross_unseal
+          changed_when: true
+          no_log: true
+
+        - name: "openbao | ops test | Assert cross-keyring restore seals, original key unseals"
+          vars:
+            _r: "{{ _cross.stdout_lines | last | from_json }}"
+          ansible.builtin.assert:
+            that:
+              - _cross.rc == 0
+              - _r.result == 'restored'
+              - _r.sealed == true
+              - "'unsealed' in _cross_unseal.stdout_lines"
+              # The second server now holds the first one's data: its own root token is gone.
+              - "'own_root_rc=0' not in _cross_unseal.stdout_lines"
+            fail_msg: "{{ _cross.stdout }} {{ _cross.stderr }} / {{ _cross_unseal.stdout_lines | default([]) | reject('search', 'token') | list }}"
+            quiet: true
+
+        - name: "openbao | ops test | All rows passed"
+          ansible.builtin.debug:
+            msg: >-
+              tls check/stale/reload/sidecar, status fields, snapshot save, restore,
+              checksum mismatch, bad login and other-keyring restore rows passed.
+      always:
+        - name: "openbao | ops test | Remove containers"
+          ansible.builtin.command:
+            argv: [docker, rm, -f, -v, "{{ _s1 }}", "{{ _s2 }}", "{{ _side }}"]
+          changed_when: true
+          failed_when: false
+
+        - name: "openbao | ops test | Remove temp dir"
+          ansible.builtin.file:
+            path: "{{ _tmp.path }}"
+            state: absent
+
+    - name: "openbao | ops test | List leftover containers"
+      ansible.builtin.command:
+        argv: [docker, ps, -a, --filter, "name=openbao-ops-test-{{ _suffix }}", --format, "{{ '{{' }}.Names{{ '}}' }}"]
+      register: _left
+      changed_when: false
+
+    - name: "openbao | ops test | Assert no container left"
+      ansible.builtin.assert:
+        that:
+          - _left.stdout | trim | length == 0
+        fail_msg: "Leftover containers: {{ _left.stdout }}"
+        quiet: true

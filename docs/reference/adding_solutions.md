@@ -139,7 +139,7 @@ components:
 | Field | Required | Notes |
 |---|---|---|
 | `name` | yes | Declare your layer here, not in ai-solutions. Unique across the merged registry. |
-| `depends_on` | yes (may be `[]`) | Layer names. Everything in those layers runs before anything in yours. |
+| `depends_on` | yes (may be `[]`) | Layer names. Everything in those layers runs before anything in yours. May be a Jinja expression that renders to a list literal (`"{{ [] if x else ['platform'] }}"`); anything else is an error. |
 | `enabled` | no | Kept for compatibility; a declared layer is part of the stack. |
 
 ### Component fields
@@ -302,6 +302,17 @@ verbose output plus `ansible -vvv`, or `trace` to add bash xtrace. Per-run logs 
 The `--check` run executes preflight, so it confirms the merge, the resolution and the
 execution order before anything touches the cluster. Read the printed plan: it is the exact
 order your components will run in.
+
+ansible-lint does not check module arguments, so a misspelled one (for example
+`label_selector` instead of `label_selectors` on `kubernetes.core.k8s_info`) passes lint
+and fails only on a live run. Check your roles against the module documentation with the
+installer's Ansible (after any `install`, it is in `.venv/`):
+
+```bash
+PATH=$PWD/.venv/bin:$PATH python3 scripts/check_module_args.py ext/<your-repo>/<roles-dir>
+```
+
+It prints `OK: <n> module calls` or one line per unknown argument, and exits 1 on any.
 
 ---
 
