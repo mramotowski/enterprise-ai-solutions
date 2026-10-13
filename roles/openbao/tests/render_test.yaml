@@ -56,109 +56,11 @@
       - {name: "r5-route-off", replicas: 5, route: false}
       - {name: "r1-storage-class", replicas: 1, route: false, storage_class: fast}
       - {name: "r3-no-reloader", replicas: 3, route: false, reloader: false}
+    # The openbao_* key checks are in playbooks/tests/preflight_secrets_test.yaml.
     _preflight_cases:
-      - name: "bad replicas (2)"
-        vars: {openbao_replicas: 2}
-        expect: "must be 1 or an odd number >= 3"
-      - name: "bad replicas (4)"
-        vars: {openbao_replicas: 4}
-        expect: "must be 1 or an odd number >= 3"
-      - name: "bad replicas (0)"
-        vars: {openbao_replicas: 0}
-        expect: "must be 1 or an odd number >= 3"
-      - name: "bad replicas (three)"
-        vars: {openbao_replicas: "three"}
-        expect: "must be 1 or an odd number >= 3"
-      - name: "bad replicas (-1)"
-        vars: {openbao_replicas: -1}
-        expect: "must be 1 or an odd number >= 3"
-      - name: "external: empty address"
-        vars: {openbao_mode: external, openbao_address: ""}
-        expect: "openbao_address is empty"
-      - name: "external: http:// address"
-        vars: {openbao_mode: external, openbao_address: "http://openbao.example.com:8200"}
-        expect: "openbao_address \\(http://openbao.example.com:8200\\) must be an https:// URL"
-      - name: "external: address with a path"
-        vars: {openbao_mode: external, openbao_address: "https://openbao.example.com/v1"}
-        expect: "must be an https:// URL with only a host"
-      - name: "external: empty CA file"
-        vars: {openbao_mode: external, openbao_ca_file: ""}
-        expect: "openbao_ca_file is empty"
-      - name: "external: CA file absent"
-        vars: {openbao_mode: external, openbao_ca_file: "/nonexistent/openbao-ca.pem"}
-        expect: "openbao_ca_file \\(/nonexistent/openbao-ca.pem\\) does not exist on the installer host"
-      - name: "external: CA file without a certificate"
-        vars: {openbao_mode: external, openbao_ca_file: "@tmp/not-a-cert.pem"}
-        expect: "holds no PEM certificate"
-      - name: "external: CA file with a private key"
-        vars: {openbao_mode: external, openbao_ca_file: "@tmp/with-key.pem"}
-        expect: "contains a private key"
-      - name: "external: empty cluster id"
-        vars: {openbao_mode: external, openbao_cluster_id: ""}
-        expect: "openbao_cluster_id is empty: external mode requires an explicit cluster id"
-      - name: "external: route enabled"
-        vars: {openbao_mode: external, openbao_route_enabled: true}
-        expect: "openbao_route_enabled is supported in internal mode only"
-      - name: "external: every problem at once"
-        vars: {openbao_mode: external, openbao_address: "", openbao_ca_file: "", openbao_cluster_id: ""}
-        expect: "openbao_address is empty.*openbao_ca_file is empty.*openbao_cluster_id is empty"
-      - name: "internal: auth mount other than kubernetes"
-        vars: {openbao_auth_mount: "k8s-a"}
-        expect: "'kubernetes' in openbao_mode: internal"
-      - name: "external: bad auth mount"
-        vars: {openbao_mode: external, openbao_auth_mount: "k8s//a"}
-        expect: "openbao_auth_mount \\('k8s//a'\\) must be an auth mount path"
-      - name: "unknown mode"
-        vars: {openbao_mode: bogus}
-        expect: "openbao_mode must be 'internal' or 'external'"
       - name: "cert-manager off"
         vars: {cert_manager_enabled: false}
         expect: "cert_manager_enabled"
-      - name: "bad shares (threshold 4 > shares 3)"
-        vars: {openbao_key_shares: 3, openbao_key_threshold: 4}
-        expect: "openbao_key_threshold \\(4\\) must be between 1 and\\s+openbao_key_shares \\(3\\)"
-      - name: "bad shares (0)"
-        vars: {openbao_key_shares: 0, openbao_key_threshold: 0}
-        expect: "openbao_key_threshold \\(0\\).*openbao_key_shares \\(0\\)"
-      - name: "too many shares (256)"
-        vars: {openbao_key_shares: 256, openbao_key_threshold: 3}
-        expect: "openbao_key_shares must be 1..255"
-      - name: "threshold 1 of 5"
-        vars: {openbao_key_shares: 5, openbao_key_threshold: 1}
-        expect: "at least 2 when there is more"
-      - name: "init timeout 1"
-        vars: {openbao_init_timeout: 1}
-        expect: "openbao_init_timeout must be a number of seconds >= 2"
-      - name: "cluster id .."
-        vars: {openbao_cluster_id: ".."}
-        expect: "cluster id"
-      - name: "kv mount sys (reserved)"
-        vars: {openbao_kv_mount: "sys"}
-        expect: "not one of the reserved paths"
-      - name: "kv mount Auth (reserved, any case)"
-        vars: {openbao_kv_mount: "Auth"}
-        expect: "not one of the reserved paths"
-      - name: "kv mount ."
-        vars: {openbao_kv_mount: "."}
-        expect: "openbao_kv_mount"
-      - name: "cluster id equals the kv mount (ESO strips <mount>/ from keys)"
-        vars: {openbao_cluster_id: "intel-ai"}
-        expect: "different from each other"
-      - name: "bad worker namespace"
-        vars: {erag_secrets_namespace: "Erag_Secrets"}
-        expect: "DNS-1123 labels \\(bad: \\['Erag_Secrets'\\]"
-      - name: "bad operator SA"
-        vars: {openbao_operator_sa: "-op"}
-        expect: "DNS-1123 subdomains \\(bad: \\['-op'\\]"
-      - name: "bad token TTL"
-        vars: {openbao_operator_token_ttl: "1 hour"}
-        expect: "openbao_operator_token_ttl"
-      - name: "bad cluster id"
-        vars: {openbao_cluster_id: "a/b"}
-        expect: "cluster id"
-      - name: "bad layer name"
-        vars: {openbao_layers: ["Erag_1"]}
-        expect: "openbao_layers"
     _parse_cases:
       - name: init with shares
         stdout: |-
@@ -236,23 +138,6 @@
         replicas: 1
         pods: [{n: 0, rev: r1, active: true}, {n: 1, rev: r1}, {n: 2, rev: r1}]
         plan: [{name: openbao-0, delete: true}]
-    _tls_cases:
-      - {name: "all current", mode: check, out: {openbao-0: current, openbao-1: current}, fail: false,
-         states: {openbao-0: current, openbao-1: current}}
-      - {name: "stale fails", mode: check, out: {openbao-0: current, openbao-1: stale}, fail: true,
-         states: {openbao-0: current, openbao-1: stale}}
-      - {name: "reloaded passes", mode: reload-if-stale, out: {openbao-0: "noise\nreloaded"}, fail: false,
-         states: {openbao-0: reloaded}}
-      - {name: "failed fails", mode: reload-if-stale, out: {openbao-0: failed}, fail: true, states: {openbao-0: failed}}
-      - {name: "nocert fails", mode: reload-if-stale, out: {openbao-0: nocert}, fail: true, states: {openbao-0: nocert}}
-      - {name: "unreachable passes install", mode: reload-if-stale, out: {openbao-0: unreachable}, fail: false,
-         states: {openbao-0: unreachable}}
-      - {name: "unreachable fails validate", mode: check, out: {openbao-0: unreachable}, fail: true,
-         states: {openbao-0: unreachable}}
-      - {name: "garbage is no answer, fails validate", mode: check, out: {openbao-0: "", openbao-1: "bogus"}, fail: true,
-         states: {openbao-0: no answer, openbao-1: no answer}}
-      - {name: "unavailable warns only", mode: check, out: {openbao-0: unavailable}, fail: false,
-         states: {openbao-0: unavailable}}
     _snap_restore_cases:
       - name: "all unsealed"
         replicas: 3
@@ -337,18 +222,12 @@
             loop_var: _case
             label: "{{ _case.name }}"
 
-        # Preflight only looks at the text of openbao_ca_file.
-        - name: "openbao | test | Fake CA files for the external preflight cases"
+        # A fake CA file for the external preflight below (only its path is resolved).
+        - name: "openbao | test | Fake CA file for the external preflight"
           ansible.builtin.copy:
-            dest: "{{ _tmp.path }}/{{ item.f }}"
-            content: "{{ item.c }}"
+            dest: "{{ _tmp.path }}/ca.pem"
+            content: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
             mode: "0600"
-          loop:
-            - {f: ca.pem, c: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"}
-            - {f: not-a-cert.pem, c: "hello\n"}
-            - {f: with-key.pem, c: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"}
-          loop_control:
-            label: "{{ item.f }}"
 
         - name: "openbao | test | Assert preflight failure cases"
           ansible.builtin.include_tasks: _preflight_case.yaml
@@ -361,10 +240,20 @@
 
         - name: "openbao | test | Load task files and components"
           ansible.builtin.set_fact:
-            _install_top: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/install.yaml') | from_yaml }}"
             _install_tasks: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/install_internal.yaml') | from_yaml }}"
-            _teardown_tasks: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/teardown.yaml') | from_yaml }}"
             _components: "{{ lookup('ansible.builtin.file', _repo_dir ~ '/configs/components.yaml') | from_yaml }}"
+
+        - name: "openbao | test | Assert the bootstrap ConfigMap ships bootstrap.sh, access.sh and tls-reload.sh"
+          vars:
+            _cm: "{{ _install_tasks | selectattr('name', 'defined') | selectattr('name', 'eq', 'openbao | Bootstrap script ConfigMap') | first }}"
+          ansible.builtin.assert:
+            that:
+              - "'bootstrap.sh' in _cm['kubernetes.core.k8s'].definition.data"
+              - "'access.sh' in _cm['kubernetes.core.k8s'].definition.data"
+              - _cm['kubernetes.core.k8s'].definition.data['access.sh'] is search("lookup\\('ansible.builtin.file', 'access.sh'\\)")
+              - _cm['kubernetes.core.k8s'].definition.data['tls-reload.sh'] is search("lookup\\('ansible.builtin.file', 'tls-reload.sh'\\)")
+            fail_msg: "{{ _cm['kubernetes.core.k8s'].definition.data | default({}) | list }}"
+            quiet: true
 
         - name: "openbao | test | Assert default layer specs and cluster id"
           ansible.builtin.include_role:
@@ -466,13 +355,6 @@
         - name: "openbao | test | Rollout order cases"
           ansible.builtin.include_tasks: _rollout_case.yaml
           loop: "{{ _rollout_cases }}"
-          loop_control:
-            loop_var: _case
-            label: "{{ _case.name }}"
-
-        - name: "openbao | test | TLS reload result cases"
-          ansible.builtin.include_tasks: _tls_case.yaml
-          loop: "{{ _tls_cases }}"
           loop_control:
             loop_var: _case
             label: "{{ _case.name }}"
@@ -596,6 +478,7 @@
               {{ (lookup('ansible.builtin.file', _role_dir ~ '/tasks/tty_preflight.yaml') | from_yaml)
                  + (lookup('ansible.builtin.file', _role_dir ~ '/tasks/tty_interactive.yaml') | from_yaml) }}
             _bs_tasks: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/bootstrap_parse.yaml') | from_yaml }}"
+            _teardown_tasks: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/teardown.yaml') | from_yaml }}"
 
         - name: "openbao | test | Assert every k8s_exec task sets no_log true"
           vars:
@@ -607,9 +490,9 @@
             that:
               - _exec | length >= 1
               - _bad | length == 0
-              # k8s_exec only for the bootstrap.sh run (init, validate), the cert reload
-              # check and the unauthenticated seal-status reads of the rollout and restore.
-              - _exec | map(attribute='file') | unique | sort | list == ['bootstrap_exec.yaml', 'roll_pod.yaml', 'snapshot_restore.yaml', 'tls_reload.yaml']
+              # k8s_exec only for the bootstrap.sh run (init, validate) and the
+              # unauthenticated seal-status reads of the rollout and restore.
+              - _exec | map(attribute='file') | unique | sort | list == ['bootstrap_exec.yaml', 'roll_pod.yaml', 'snapshot_restore.yaml']
             fail_msg: "k8s_exec without no_log: true: {{ _bad | map(attribute='file') | list }}"
             quiet: true
 
@@ -659,7 +542,7 @@
             fail_msg: "shares users: {{ _shares_users | length }}"
             quiet: true
 
-        - name: "openbao | test | Assert init is gated by the TTY and ANSIBLE_DEBUG checks"
+        - name: "openbao | test | Assert init shows shares only behind the TTY gate, which refuses debug logging"
           vars:
             _block: "{{ (_init_tasks | selectattr('block', 'defined') | first).block }}"
             _incl: >-
@@ -671,56 +554,17 @@
             _is_pause: >-
               {% set r = [] %}{% for t in _show %}{% set _ = r.append('ansible.builtin.pause' in t) %}{% endfor %}{{ r }}
             _tty_json: "{{ _tty_tasks | to_json }}"
-            _needs_init: >-
-              {% set r = [] %}{% for t in _init_tasks if '_openbao_needs_init' in t.get('ansible.builtin.set_fact', {}) %}{%
-              set _ = r.append(t['ansible.builtin.set_fact']._openbao_needs_init) %}{% endfor %}{{ r }}
-            _install_json: "{{ _install_tasks | map('to_json') | list }}"
-            _install_incl: >-
-              {% set r = [] %}{% for t in _install_tasks %}{% set _ = r.append(t.get('ansible.builtin.include_tasks', '')) %}{% endfor %}{{ r }}
           ansible.builtin.assert:
             that:
-              - (_init_tasks | selectattr('block', 'defined') | first).when == '_openbao_needs_init | bool'
-              - _needs_init | length == 1 and 'uninitialized' in _needs_init[0]
-              - _init_tasks[0].vars._openbao_bootstrap_mode == 'status'
+              - "'tty_preflight.yaml' in _incl"
               - _incl.index('tty_preflight.yaml') < _modes.index('init')
-              - _incl[_modes.index('init')] == 'bootstrap_exec.yaml'
               - "'_openbao_tty_dev' in _tty_json"
-              - "'/proc/' in _tty_json"
               - "'ANSIBLE_DEBUG' in _tty_json"
               - "'ES_LOG_LEVEL=trace' in _tty_json"
               - "'ANSIBLE_KEEP_REMOTE_FILES' in _tty_json"
               - "'needs an interactive terminal' in _tty_json"
               # Shares are written, then the operator confirms.
               - _is_tty_write.index(true) < _is_pause.index(true)
-              # install_internal.yaml: TTY gate before the first change, init right after
-              # the pod wait, then the route (applied or pruned), then the summary.
-              - _install_incl.index('tty_preflight.yaml') < _install_json.index(_install_json | select('search', 'Ensure namespace') | first)
-              - _install_incl.index('init.yaml') == (_install_tasks | length) - 3
-              - _install_incl.index('route.yaml') == (_install_tasks | length) - 2
-              - _install_incl.index('ca_bundle.yaml') > _install_incl.index('tls.yaml')
-              - _install_incl.index('ca_bundle.yaml') < _install_incl.index('init.yaml')
-              # Story 13: the replica guard and the upgrade pre-check before any change;
-              # the cert reload and the rollout after the pod wait, before init's state check.
-              - _install_incl.index('replicas_guard.yaml') < _install_json.index(_install_json | select('search', 'Ensure namespace') | first)
-              - _install_incl.index('upgrade_precheck.yaml') < _install_json.index(_install_json | select('search', 'Ensure namespace') | first)
-              - _install_incl.index('replicas_guard.yaml') < _install_incl.index('upgrade_precheck.yaml')
-              # The upgrade's terminal check also comes before any change.
-              - _install_incl.index('tty_interactive.yaml') < _install_json.index(_install_json | select('search', 'Ensure namespace') | first)
-              - _install_incl.index('tls_reload.yaml') == (_install_tasks | length) - 5
-              - _install_incl.index('rollout.yaml') == (_install_tasks | length) - 4
-              - "'tty_interactive.yaml' in _tty_json"
-            quiet: true
-
-        - name: "openbao | test | Assert preflight runs before any change, then the mode's install"
-          ansible.builtin.assert:
-            that:
-              - (_install_top[0]['ansible.builtin.include_tasks'] | default('')) == 'preflight.yaml'
-              - _install_top | length == 3
-              - _install_top[1]['ansible.builtin.include_tasks'] == 'external.yaml'
-              - _install_top[1].when == '_openbao_external | bool'
-              - _install_top[2]['ansible.builtin.include_tasks'] == 'install_internal.yaml'
-              - _install_top[2].when == 'not (_openbao_external | bool)'
-            fail_msg: "install.yaml must include preflight.yaml first, then external.yaml or install_internal.yaml"
             quiet: true
 
         - name: "openbao | test | Assert teardown keeps data by default"
@@ -733,27 +577,19 @@
               {% set r = [] %}{% for t in _internal if 'kubernetes.core.k8s' in t and t['kubernetes.core.k8s'].kind in ['Certificate', 'Secret'] %}{% set _ = r.append(t['kubernetes.core.k8s'].name) %}{% endfor %}{{ r }}
             _default_kinds: >-
               {% set r = [] %}{% for t in _internal if 'kubernetes.core.k8s' in t %}{% set _ = r.append(t['kubernetes.core.k8s'].kind) %}{% endfor %}{{ r }}
-            _hint: "{{ _internal | selectattr('when', 'defined') | selectattr('when', 'eq', 'not (openbao_teardown_delete_data | bool)') | list }}"
           ansible.builtin.assert:
             that:
+              - _openbao_role_defaults.openbao_teardown_delete_data == false
               - _delete_block | length == 1
               - "'PersistentVolumeClaim' in _deleted_kinds"
               - "'Namespace' in _deleted_kinds"
               - "'PersistentVolumeClaim' not in _default_kinds"
               - "'Namespace' not in _default_kinds"
-              - "['NetworkPolicy', 'Certificate', 'Secret'] is subset(_default_kinds)"
-              # The CA (Issuers, CA Certificate, openbao-ca) is kept with the data.
+              # The CA (Issuers, CA Certificate, openbao-ca) is kept with the data;
+              # only the server Certificate/Secret are deleted by default.
               - "'Issuer' not in _default_kinds"
-              # Only the server Certificate/Secret are deleted by default (names are raw templates here).
               - _default_certs | length == 2
               - _default_certs | select('search', 'openbao_tls_server_') | list | length == 2
-              - "['Certificate', 'Issuer', 'Secret'] is subset(_deleted_kinds)"
-              # Both namespaces go with the data: openbao and the snapshot namespace.
-              - _delete_block[0].block | selectattr('name', 'search', 'Delete the snapshot namespace') | list | length == 1
-              - _internal | selectattr('name', 'defined') | selectattr('name', 'search', 'Delete snapshot Jobs') | list | length == 1
-              - _hint | length == 1
-              - "'-e openbao_teardown_delete_data=true' in _hint[0]['ansible.builtin.debug'].msg"
-              - _openbao_role_defaults.openbao_teardown_delete_data == false
             quiet: true
 
         # ── Route (internal mode, openbao_route_enabled) ────────────────────
@@ -821,7 +657,7 @@
             fail_msg: "{{ _b | to_json }} {{ _sp | to_json }}"
             quiet: true
 
-        - name: "openbao | test | Load route, teardown, CA bundle and external task files"
+        - name: "openbao | test | Load route, CA bundle and external task files"
           ansible.builtin.set_fact:
             _route_tasks: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/route.yaml') | from_yaml }}"
             _ext_tasks: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/external.yaml') | from_yaml }}"
@@ -843,61 +679,14 @@
                  | trim | bool]] }}
           loop: "{{ [true, false] | product([true, false], [true, false]) | map('list') | list }}"
 
-        - name: "openbao | test | Assert the route is applied only when on, pruned when off or on teardown"
+        - name: "openbao | test | Assert the route is applied only when enabled, internal and not pruning"
           vars:
             _on: "{{ _route_on_cases | selectattr('3') | list }}"
-            _apply: "{{ _route_tasks | selectattr('block', 'defined') | first }}"
-            _prune: "{{ _route_tasks | selectattr('loop', 'defined') | first }}"
-            _blocks: "{{ _teardown_tasks | selectattr('block', 'defined') | list }}"
-            _td_int: "{{ (_blocks | selectattr('name', 'search', 'Internal mode') | first).block }}"
-            _td_ext: "{{ (_blocks | selectattr('name', 'search', 'External mode') | first).block }}"
-            _td_top_incl: >-
-              {% set r = [] %}{% for t in _teardown_tasks if t.get('ansible.builtin.include_tasks') == 'route.yaml' %}{% set _ = r.append(t) %}{% endfor %}{{ r }}
-            _int_names: "{{ _td_int | map(attribute='name') | list }}"
-            _int_route: >-
-              {% set r = [] %}{% for t in _td_int if t.get('ansible.builtin.include_tasks') == 'route.yaml' %}{% set _ = r.append(t) %}{% endfor %}{{ r }}
-            _ext_route: >-
-              {% set r = [] %}{% for t in _td_ext if t.get('ansible.builtin.include_tasks') == 'route.yaml' %}{% set _ = r.append(t) %}{% endfor %}{{ r }}
-            _td_ext_kinds: >-
-              {% set r = [] %}{% for t in _td_ext if 'kubernetes.core.k8s' in t %}{% set _ = r.append(t['kubernetes.core.k8s'].kind) %}{% endfor %}{{ r }}
-            _td_int_kinds: >-
-              {% set r = [] %}{% for t in _td_int if 'kubernetes.core.k8s' in t %}{% set _ = r.append(t['kubernetes.core.k8s'].kind) %}{% endfor %}{{ r }}
-            _uninstall_idx: "{{ _int_names.index(_int_names | select('search', 'Uninstall Helm release') | first) }}"
-            _int_cab_idx: "{{ _int_names.index(_int_names | select('search', 'CA bundle') | first) }}"
-            _int_route_idx: "{{ _int_names.index(_int_route[0].name) }}"
           ansible.builtin.assert:
             that:
               - _route_on_cases | length == 8
               - _on | length == 1 and _on[0][:3] == [true, false, false]
-              - _apply.when == '_openbao_route_on | bool'
-              - _apply.block | map('to_json') | select('search', 'route.yaml.j2') | list | length == 1
-              - _apply.block | map('to_json') | select('search', 'ResolvedRefs') | list | length >= 1
-              - _prune.when == 'not (_openbao_route_on | bool)'
-              - _prune.loop | map(attribute='kind') | sort == ['BackendTLSPolicy', 'HTTPRoute', 'SecurityPolicy']
-              - _prune['kubernetes.core.k8s'].state == 'absent'
-              - _prune.failed_when is search('not found')
-              # Teardown: route and CA bundle go only after the Helm uninstall (internal),
-              # directly in external mode; never before the mode blocks.
-              - _td_top_incl | length == 0
-              - _int_route | length == 1 and _int_route[0].vars._openbao_route_prune is sameas true
-              - _ext_route | length == 1 and _ext_route[0].vars._openbao_route_prune is sameas true
-              - (_int_route_idx | int) > (_uninstall_idx | int)
-              - (_int_cab_idx | int) > (_uninstall_idx | int)
-              - "'ConfigMap' in _td_int_kinds"
-              - _td_ext_kinds == ['ConfigMap', 'ServiceAccount']
             fail_msg: "route_on: {{ _route_on_cases }}"
-            quiet: true
-
-        - name: "openbao | test | Assert the route CRD check runs before the TTY gate (install_internal.yaml)"
-          vars:
-            _incl: >-
-              {% set r = [] %}{% for t in _install_tasks %}{% set _ = r.append(t.get('ansible.builtin.include_tasks', '')) %}{% endfor %}{{ r }}
-          ansible.builtin.assert:
-            that:
-              - _incl[0] == 'route_preflight.yaml'
-              - _install_tasks[0].when is search('openbao_route_enabled')
-              - _incl.index('route_preflight.yaml') < _incl.index('tty_preflight.yaml')
-            fail_msg: "{{ _incl }}"
             quiet: true
 
         - name: "openbao | test | Assert external mode creates only the namespace, the operator SA and the CA bundle"

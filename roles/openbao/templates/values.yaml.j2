@@ -97,25 +97,22 @@ server:
 {% if openbao_tls_reloader_enabled | bool %}
 
   # OpenBao reads its listener certificate only at start and on SIGHUP. The
-  # sidecar (files/tls-reload.sh watch) sends SIGHUP to the bao server process
-  # once cert-manager renewed the mounted certificate. Signalling it needs the
-  # shared process namespace; the sidecar has no ports and no API rights, runs
-  # the server image as the same non-root user and reads only public files.
+  # sidecar (files/tls-reload.sh) sends SIGHUP to the bao server process once
+  # after start and whenever the mounted tls.crt changed (cert-manager renewal).
+  # Signalling it needs the shared process namespace; the sidecar has no ports
+  # and no API rights, runs the server image as the same non-root user and
+  # reads only public files.
   shareProcessNamespace: true
   extraContainers:
     - name: tls-reloader
       image: {{ openbao_image | to_json }}
       imagePullPolicy: IfNotPresent
-      command: ["/bin/sh", {{ openbao_tls_reload_script_path | to_json }}, "watch"]
+      command: ["/bin/sh", {{ openbao_tls_reload_script_path | to_json }}]
       env:
         - name: OB_TLS_DIR
           value: {{ _tls | to_json }}
-        - name: OB_TLS_ADDR
-          value: "https://127.0.0.1:8200"
         - name: OB_TLS_INTERVAL
           value: {{ openbao_tls_reloader_interval | string | to_json }}
-        - name: HOME
-          value: "/tmp"
       resources: {{ openbao_tls_reloader_resources | to_json }}
       securityContext:
         allowPrivilegeEscalation: false

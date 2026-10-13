@@ -109,11 +109,6 @@
     - name: "openbao | validate | Fail unless initialized, unsealed and bootstrapped"
       ansible.builtin.include_tasks: state_fail.yaml
 
-    - name: "openbao | validate | Every pod serves the current listener certificate"
-      ansible.builtin.include_tasks: tls_reload.yaml
-      vars:
-        _openbao_tls_mode: check
-
     - name: "openbao | validate | Read the StatefulSet revision"
       kubernetes.core.k8s_info:
         api_version: apps/v1
@@ -131,17 +126,12 @@
              | rejectattr('metadata.labels.controller-revision-hash', 'defined') | map(attribute='metadata.name') | list
              + (_openbao_pods.resources | default([]) | selectattr('metadata.labels.controller-revision-hash', 'defined')
                 | rejectattr('metadata.labels.controller-revision-hash', 'eq', _rev) | map(attribute='metadata.name') | list) }}
-        _no_reloader: >-
-          {% set r = [] %}{% for p in _openbao_pods.resources | default([]) %}{% if 'tls-reloader' not in
-          (p.spec.containers | default([]) | map(attribute='name') | list) %}{% set _ = r.append(p.metadata.name) %}{% endif %}{%
-          endfor %}{{ r }}
       ansible.builtin.debug:
         msg: >-
-          WARNING: {{ (_old + (_no_reloader if openbao_tls_reloader_enabled | bool else [])) | unique | join(', ') }}
-          run(s) an older pod template{{ ' (no tls-reloader sidecar: a renewed server certificate is served only after install/upgrade or a manual SIGHUP)' if (openbao_tls_reloader_enabled | bool) and _no_reloader | length > 0 else '' }}.
+          WARNING: {{ _old | join(', ') }} run(s) an older pod template.
           Restart them with ./es_auto_installer.sh install openbao --env {{ env_name | default('<env>') }} --only
           -- -e openbao_upgrade=true (docs/deploy/openbao.md, "Upgrades").
-      when: (_old + (_no_reloader if openbao_tls_reloader_enabled | bool else [])) | length > 0
+      when: _old | length > 0
 
     - name: "openbao | validate | OpenBao ready"
       ansible.builtin.debug:

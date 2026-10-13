@@ -174,9 +174,7 @@
     fail_msg: >-
       OpenBao snapshot {{ _openbao_snapshot_mode }} failed at '{{ _openbao_snapshot_result.stage | default('?') }}':
       {{ _openbao_snapshot_result.error | default('') }}. Check that OpenBao is unsealed, that role
-      'backup' binds {{ openbao_backup_namespace }}/{{ openbao_backup_sa }} (an install bootstrapped before
-      the snapshot namespace existed binds namespace {{ openbao_namespace }}: see docs/deploy/openbao.md,
-      "Change the bootstrap (generate-root)") and that the NetworkPolicy admits {{ openbao_backup_namespace }}.
+      'backup' binds {{ openbao_backup_namespace }}/{{ openbao_backup_sa }} and that the NetworkPolicy admits {{ openbao_backup_namespace }}.
     success_msg: >-
       OpenBao snapshot {{ _openbao_snapshot_result.result }}: {{ _openbao_snapshot_result.bytes }} bytes,
       sha256 {{ _openbao_snapshot_result.sha256 }} ({{ openbao_backup_namespace }}/{{ openbao_snapshot_pvc }}).

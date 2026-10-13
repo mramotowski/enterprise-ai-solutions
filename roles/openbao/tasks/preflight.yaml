@@ -5,13 +5,11 @@
 # openbao — Preflight
 #
 # Included at the top of install.yaml and validate.yaml (and by
-# tests/render_test.yaml). Asserts only: nothing here touches the cluster or
-# OpenBao. Also resolves the facts the install, the checks and the chart
-# values need. Internal-only asserts (cert-manager, Raft, Shamir, peers, SANs)
-# run only with openbao_mode: internal; external mode checks its own keys.
-
-- name: "openbao | Preflight — openbao_mode"
-  ansible.builtin.include_tasks: assert_mode.yaml
+# tests/render_test.yaml). Nothing here touches the cluster or OpenBao: it
+# resolves the facts the install, the checks and the chart values need, and
+# checks that cert-manager is on in internal mode. The user-facing openbao_*
+# keys are validated once, before any role, by the global preflight
+# (playbooks/includes/preflight_secrets.yaml).
 
 - name: "openbao | Preflight — Mode"
   ansible.builtin.set_fact:
@@ -25,122 +23,17 @@
          if (openbao_mode | default('internal')) == 'external' and (openbao_ca_file | default('', true) | string | trim | length > 0)
          else '' }}
 
-# One or more path segments ("kubernetes", "k8s/cluster-a"); it ends up in
-# login URLs and in the route allowlist.
-- name: "openbao | Preflight — openbao_auth_mount"
-  ansible.builtin.assert:
-    that:
-      - _openbao_auth_mount is match('^[A-Za-z0-9_-]+([./][A-Za-z0-9_-]+)*$')
-      - _openbao_external | bool or _openbao_auth_mount == 'kubernetes'
-    fail_msg: >-
-      openbao_auth_mount ('{{ _openbao_auth_mount }}') must be an auth mount path of
-      [A-Za-z0-9_-] segments separated by a single / or . (no leading, trailing or doubled
-      separator), and
-      'kubernetes' in openbao_mode: internal (only external mode can use another mount,
-      e.g. one per cluster sharing an OpenBao).
-    quiet: true
-
-# ── External mode ─────────────────────────────────────────────────────────────
-
-- name: "openbao | Preflight — external mode keys"
-  when: _openbao_external | bool
-  vars:
-    _pf_ext_addr: "{{ openbao_address | default('', true) | string | trim }}"
-    _pf_ext_ca: "{{ _openbao_ca_file }}"
-    _pf_ext_ca_pem: "{{ lookup('ansible.builtin.file', _pf_ext_ca) if (_pf_ext_ca | length > 0 and _pf_ext_ca is file) else '' }}"
-    _pf_ext_cid: "{{ openbao_cluster_id | default('', true) | string | trim }}"
-    _pf_ext_problems: >-
-      {{ (['openbao_address is empty (the https:// URL of your OpenBao, e.g. https://openbao.example.com:8200)'] if _pf_ext_addr | length == 0 else [])
-         + (['openbao_address (' ~ _pf_ext_addr ~ ') must be an https:// URL with only a host and an optional port (http:// is not allowed)']
-            if _pf_ext_addr | length > 0 and _pf_ext_addr is not match('^https://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?/?$') else [])
-         + (['openbao_ca_file is empty (a PEM file on the installer host with the CA that signed openbao_address)'] if _pf_ext_ca | length == 0 else [])
-         + (['openbao_ca_file (' ~ _pf_ext_ca ~ ') does not exist on the installer host'] if _pf_ext_ca | length > 0 and _pf_ext_ca is not file else [])
-         + (['openbao_ca_file (' ~ _pf_ext_ca ~ ') holds no PEM certificate'] if _pf_ext_ca is file and '-----BEGIN CERTIFICATE-----' not in _pf_ext_ca_pem else [])
-         + (['openbao_ca_file (' ~ _pf_ext_ca ~ ') contains a private key; give the CA certificate only'] if _pf_ext_ca is file and 'PRIVATE KEY' in _pf_ext_ca_pem else [])
-         + (['openbao_cluster_id is empty: external mode requires an explicit cluster id, unique per cluster sharing the OpenBao'] if _pf_ext_cid | length == 0 else [])
-         + (['openbao_route_enabled is supported in internal mode only (your OpenBao publishes its own endpoint)']
-            if openbao_route_enabled | default(false) | bool else []) }}
-  ansible.builtin.assert:
-    that:
-      - _pf_ext_problems | length == 0
-    fail_msg: "openbao_mode: external — {{ _pf_ext_problems | join('; ') }}."
-    quiet: true
-
 # ── Internal mode ─────────────────────────────────────────────────────────────
 
-- name: "openbao | Preflight — internal mode"
+- name: "openbao | Preflight — cert-manager is enabled (internal mode)"
   when: not (_openbao_external | bool)
-  block:
-    - name: "openbao | Preflight — cert-manager is enabled"
-      ansible.builtin.assert:
-        that:
-          - cert_manager_enabled | default(true) | bool
-        fail_msg: >-
-          openbao_mode: internal takes its listener TLS from cert-manager, but
-          cert_manager_enabled is false. Set cert_manager_enabled: true or use
-          secrets_backend: local.
-        quiet: true
-
-    - name: "openbao | Preflight — openbao_replicas is 1 or an odd number >= 3"
-      ansible.builtin.assert:
-        that:
-          - (openbao_replicas | default(1) | string) is match('^[0-9]+$')
-          - (openbao_replicas | default(1) | int) == 1 or
-            ((openbao_replicas | default(1) | int) >= 3 and (openbao_replicas | default(1) | int) is odd)
-        fail_msg: >-
-          openbao_replicas must be 1 or an odd number >= 3 for a Raft quorum
-          (got '{{ openbao_replicas | default('') }}').
-        quiet: true
-
-    - name: "openbao | Preflight — unseal shares and threshold"
-      ansible.builtin.assert:
-        that:
-          - (openbao_key_shares | string) is match('^[0-9]+$')
-          - (openbao_key_threshold | string) is match('^[0-9]+$')
-          - (openbao_key_shares | int) >= 1
-          - (openbao_key_threshold | int) >= 1
-          - (openbao_key_threshold | int) <= (openbao_key_shares | int)
-          - (openbao_key_shares | int) <= 255
-          - (openbao_key_shares | int) == 1 or (openbao_key_threshold | int) >= 2
-        fail_msg: >-
-          openbao_key_threshold ({{ openbao_key_threshold }}) must be between 1 and
-          openbao_key_shares ({{ openbao_key_shares }}), and at least 2 when there is more
-          than one share; openbao_key_shares must be 1..255.
-        quiet: true
-
-    - name: "openbao | Preflight — openbao_init_timeout"
-      ansible.builtin.assert:
-        that:
-          - (openbao_init_timeout | string) is match('^[0-9]+$')
-          - (openbao_init_timeout | int) >= 2
-        fail_msg: "openbao_init_timeout must be a number of seconds >= 2 (got '{{ openbao_init_timeout }}')."
-        quiet: true
-
-# ── Both modes ────────────────────────────────────────────────────────────────
-
-- name: "openbao | Preflight — KV mount, cluster id and layers are path-safe"
-  vars:
-    _pf_cid: "{{ openbao_cluster_id | default('', true) or env_name | default('') }}"
   ansible.builtin.assert:
     that:
-      - (openbao_kv_mount | default('') | string) is match('^[A-Za-z0-9._-]+$')
-      - (openbao_kv_mount | default('') | string) not in ['.', '..']
-      # Reserved OpenBao paths: /v1/<mount> would become /v1/sys etc. (route allowlist).
-      - (openbao_kv_mount | default('') | string | lower) not in ['sys', 'auth', 'identity', 'cubbyhole', 'token']
-      - (_pf_cid | string) is match('^[A-Za-z0-9._-]+$')
-      - (_pf_cid | string) not in ['.', '..']
-      # The ESO vault provider strips a leading '<mount>/' from every key.
-      - (_pf_cid | string) != (openbao_kv_mount | default('') | string)
-      - openbao_layers | default([]) is sequence
-      - openbao_layers | default([]) is not string
-      - openbao_layers | default([]) | length > 0
-      - openbao_layers | default([]) | map('string') | select('match', '^[a-z0-9][a-z0-9-]*$') | list | length == (openbao_layers | default([]) | length)
+      - cert_manager_enabled | default(true) | bool
     fail_msg: >-
-      openbao_kv_mount ('{{ openbao_kv_mount | default('') }}', not one of the reserved paths
-      sys, auth, identity, cubbyhole, token) and the cluster id
-      ('{{ _pf_cid }}', from openbao_cluster_id or the env name) must be non-empty names of
-      [A-Za-z0-9._-] other than . and .., and different from each other; openbao_layers ({{ openbao_layers | default([]) }}) must be a
-      non-empty list of lower-kebab layer names.
+      openbao_mode: internal takes its listener TLS from cert-manager, but
+      cert_manager_enabled is false. Set cert_manager_enabled: true or use
+      secrets_backend: local.
     quiet: true
 
 # ESO lives in its own role; read its namespace default without letting
@@ -187,42 +80,3 @@
          + (_short | map('regex_replace', '$', '.' ~ _ns ~ '.svc') | list)
          + (_short | map('regex_replace', '$', '.' ~ _ns ~ '.svc.' ~ _cd) | list) }}
     _openbao_server_ip_addresses: ["127.0.0.1"]
-
-# Everything the roles bind to (bootstrap.sh in internal mode, the operator's
-# template in external mode), checked before any cluster change.
-- name: "openbao | Preflight — namespaces and ServiceAccounts"
-  vars:
-    _label: '^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$'
-    _subdomain: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
-    _namespaces: >-
-      {{ [_openbao_eso_namespace, openbao_operator_namespace, openbao_backup_namespace, openbao_namespace]
-         + (_openbao_layer_specs | map('split', ':') | map(attribute=1) | list) }}
-    _sas: >-
-      {{ [_openbao_eso_sa, openbao_operator_sa, openbao_backup_sa]
-         + (_openbao_layer_specs | map('split', ':') | map(attribute=2) | list)
-         + (openbao_layers | map('regex_replace', '$', '-secrets-importer') | list) }}
-    _bad_ns: "{{ _namespaces | map('string') | reject('match', _label) | list }}"
-    _bad_sa: >-
-      {{ _sas | map('string') | reject('match', _subdomain) | list
-         + (_sas | map('string') | select('match', '^.{254,}$') | list) }}
-  ansible.builtin.assert:
-    that:
-      - _bad_ns | length == 0
-      - _bad_sa | length == 0
-    fail_msg: >-
-      Invalid OpenBao role bindings: namespaces must be DNS-1123 labels (bad: {{ _bad_ns }}),
-      ServiceAccount names DNS-1123 subdomains (bad: {{ _bad_sa }}).
-    quiet: true
-
-- name: "openbao | Preflight — TTL, hosts and peers (internal mode)"
-  when: not (_openbao_external | bool)
-  ansible.builtin.assert:
-    that:
-      - (openbao_operator_token_ttl | string) is match('^[0-9]+[smh]?$')
-      - (openbao_k8s_host | string) is match('^https://[A-Za-z0-9.:/_-]+$')
-      - _openbao_peer_addrs | reject('match', '^https://[a-z0-9.-]+:[0-9]+$') | list | length == 0
-    fail_msg: >-
-      Invalid OpenBao bootstrap inputs: openbao_operator_token_ttl
-      ('{{ openbao_operator_token_ttl }}') must be a duration like 1h; openbao_k8s_host
-      ('{{ openbao_k8s_host }}') an https:// URL; peer addresses {{ _openbao_peer_addrs }}.
-    quiet: true

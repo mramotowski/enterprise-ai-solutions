@@ -10,7 +10,6 @@
 #   delete-role <role>                    delete one Kubernetes-auth role
 #   disable-mount <path>                  disable a secrets engine mount
 #   disable-auth <path>                   disable an auth method
-#   bind-backup <namespace>               re-bind role backup to another namespace
 #   remount-kv1 <path>                    replace a mount with a KV version 1 one
 #   apply <layer spec>...                 pipe the token into bootstrap.sh apply
 #                                         (the runbook path); print its JSON result
@@ -75,11 +74,6 @@ disable-mount)
 	;;
 disable-auth)
 	t auth disable "$1" >/dev/null
-	;;
-bind-backup)
-	# An install bootstrapped before the snapshot namespace existed.
-	t write auth/kubernetes/role/backup bound_service_account_names=openbao-snapshot \
-		bound_service_account_namespaces="$1" token_policies=backup audience=vault >/dev/null
 	;;
 remount-kv1)
 	t secrets disable "$1" >/dev/null && t secrets enable -path="$1" -version=1 kv >/dev/null

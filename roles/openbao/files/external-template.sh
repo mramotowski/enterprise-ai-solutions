@@ -1,7 +1,8 @@
 #!/bin/sh
 # OpenBao setup for one cluster with openbao_mode: external.
 # The same mount, auth, policies and roles as roles/openbao/files/bootstrap.sh
-# (internal mode), for an OpenBao you run. Run it as an OpenBao administrator:
+# (internal mode; both use access.sh, which must sit next to this file), for an
+# OpenBao you run. Run it as an OpenBao administrator:
 # BAO_ADDR, BAO_CACERT and a token allowed to manage mounts, auth methods,
 # policies and audit devices (bao login, or BAO_TOKEN) must be set.
 # Safe to re-run: existing mounts are checked, policies and roles rewritten.
@@ -38,99 +39,49 @@ a=$AUTH_MOUNT
 flat() { tr -d ' \n\r\t'; }
 die() { printf 'external-template: %s\n' "$*" >&2; exit 1; }
 
-for spec in $LAYERS; do
-	case "$spec" in
-	*:*:*:* | :* | *::* | *:) die "bad LAYERS entry '$spec' (<layer>:<namespace>:<serviceaccount>)" ;;
-	*:*:*) ;;
-	*) die "bad LAYERS entry '$spec' (<layer>:<namespace>:<serviceaccount>)" ;;
-	esac
-done
+# The mounts, policies and roles (shared with the internal bootstrap.sh) are in
+# access.sh, next to this script.
+ACC_KV=$m ACC_CID=$c ACC_AUTH=$a ACC_PREFIX="$c-" ACC_LAYERS=$LAYERS ACC_AUDIENCE=$AUDIENCE
+ACC_ESO_SA=$ESO_SA ACC_ESO_NS=$ESO_NAMESPACE
+ACC_OP_SA=$OPERATOR_SA ACC_OP_NS=$OPERATOR_NAMESPACE ACC_OP_TTL=$OPERATOR_TOKEN_TTL
+bao_write() { st=$1; shift; bao "$@" >/dev/null || die "$st failed"; }
+bao_read() { bao "$@"; }
+acc_fail() { die "$*"; }
+# Run as a file (sh <path>/external-template.sh), never piped: access.sh is
+# looked up next to it.
+case "$0" in
+*/external-template.sh) ACC_DIR=${0%/*} ;;
+external-template.sh) ACC_DIR=. ;;
+*) die "run this file by path (sh <dir>/external-template.sh), not piped: it needs access.sh from its directory" ;;
+esac
+[ -r "$ACC_DIR/access.sh" ] || die "cannot read $ACC_DIR/access.sh: keep access.sh next to external-template.sh"
+# shellcheck source=access.sh
+. "$ACC_DIR/access.sh"
+command -v acc_policies >/dev/null 2>&1 || die "$ACC_DIR/access.sh does not define acc_policies: use the access.sh of the same repo checkout"
+
+acc_params_ok || die "$ACC_BAD"
 
 # 1. KV v2 mount (shared by every cluster; paths are <mount>/<kind>/<cluster_id>/...)
-if bao secrets list -format=json | flat | grep -qF "\"$m/\":{"; then
-	info=$(bao read -format=json "sys/mounts/$m" | flat)
-	case "$info" in *'"type":"kv"'*'"version":"2"'* | *'"version":"2"'*'"type":"kv"'*) ;;
-	*) die "mount $m/ exists but is not KV version 2" ;;
-	esac
-else
-	bao secrets enable -path="$m" -version=2 kv
-fi
-
-# 2. Kubernetes auth for this cluster
-if bao auth list -format=json | flat | grep -qF "\"$a/\":{"; then
-	case "$(bao read -format=json "sys/auth/$a" | flat)" in *'"type":"kubernetes"'*) ;;
-	*) die "auth/$a exists but is not a kubernetes auth method" ;;
-	esac
-else
-	bao auth enable -path="$a" kubernetes
-fi
+#    and Kubernetes auth for this cluster
+acc_mounts
 # On a shared OpenBao the mount may already serve another cluster: never repoint it silently.
 old_host=$(bao read -format=json "auth/$a/config" 2>/dev/null | flat | sed -n 's/.*"kubernetes_host":"\([^"]*\)".*/\1/p')
 if [ -n "$old_host" ] && [ "$old_host" != "$K8S_HOST" ] && [ "$FORCE" != 1 ]; then
 	die "auth/$a/config points at $old_host, not $K8S_HOST: use another AUTH_MOUNT for this cluster, or FORCE=1 to overwrite"
 fi
 if [ -n "$REVIEWER_JWT_FILE" ]; then
-	bao write "auth/$a/config" kubernetes_host="$K8S_HOST" kubernetes_ca_cert=@"$K8S_CA_FILE" \
+	bao_write "auth config" write "auth/$a/config" kubernetes_host="$K8S_HOST" kubernetes_ca_cert=@"$K8S_CA_FILE" \
 		token_reviewer_jwt=@"$REVIEWER_JWT_FILE" disable_local_ca_jwt=true
 else
-	bao write "auth/$a/config" kubernetes_host="$K8S_HOST" kubernetes_ca_cert=@"$K8S_CA_FILE" \
+	bao_write "auth config" write "auth/$a/config" kubernetes_host="$K8S_HOST" kubernetes_ca_cert=@"$K8S_CA_FILE" \
 		disable_local_ca_jwt=true
 fi
 
-# 3. Per layer: ESO (read), worker (read/write/delete), importer (migration)
-for spec in $LAYERS; do
-	l=${spec%%:*}
-	rest=${spec#*:}
-	wns=${rest%%:*}
-	wsa=${rest#*:}
+# 2. Per layer: ESO (read), worker (read/write/delete), importer (migration);
+#    then operator (people, and the installer's read-only checks).
+acc_policies
 
-	bao policy write "$c-eso-$l" - <<EOF
-path "$m/data/$c/$l/*" {
-  capabilities = ["read"]
-}
-EOF
-	bao write "auth/$a/role/eso-$l" \
-		bound_service_account_names="$ESO_SA" bound_service_account_namespaces="$ESO_NAMESPACE" \
-		token_policies="$c-eso-$l" audience="$AUDIENCE"
-
-	bao policy write "$c-$l-secrets-worker" - <<EOF
-path "$m/data/$c/$l/*" {
-  capabilities = ["create", "update", "read", "delete"]
-}
-path "$m/metadata/$c/$l/*" {
-  capabilities = ["read", "list", "delete"]
-}
-EOF
-	bao write "auth/$a/role/$l-secrets-worker" \
-		bound_service_account_names="$wsa" bound_service_account_namespaces="$wns" \
-		token_policies="$c-$l-secrets-worker" audience="$AUDIENCE"
-
-	bao policy write "$c-$l-secrets-importer" - <<EOF
-path "$m/data/$c/$l/*" {
-  capabilities = ["create", "update", "read"]
-}
-EOF
-	bao write "auth/$a/role/$l-secrets-importer" \
-		bound_service_account_names="$l-secrets-importer" bound_service_account_namespaces="$wns" \
-		token_policies="$c-$l-secrets-importer" audience="$AUDIENCE"
-done
-
-# 4. Operator (people, and the installer's read-only checks). '+' is one path
-#    segment (data, metadata); listing audit devices needs sudo on sys/audit.
-bao policy write "$c-operator" - <<EOF
-path "$m/+/$c/*" {
-  capabilities = ["read", "create", "update", "list"]
-}
-path "sys/audit" {
-  capabilities = ["read", "sudo"]
-}
-EOF
-bao write "auth/$a/role/operator" \
-	bound_service_account_names="$OPERATOR_SA" bound_service_account_namespaces="$OPERATOR_NAMESPACE" \
-	token_policies="$c-operator" audience="$AUDIENCE" \
-	token_ttl="$OPERATOR_TOKEN_TTL" token_max_ttl="$OPERATOR_TOKEN_TTL"
-
-# 5. Audit device (AD-18): at least one must be enabled. OpenBao 2.7 refuses
+# 3. Audit device (AD-18): at least one must be enabled. OpenBao 2.7 refuses
 #    audit devices created through the API: declare one in the server config,
 #    e.g. audit "file" "file" { options { file_path = "stdout" } }.
 audit=$(bao audit list -format=json 2>/dev/null) || die "cannot list audit devices (needs sudo on sys/audit)"

@@ -7,11 +7,16 @@ ansible-lint does not catch unknown module arguments (for example
 `k8s_info: label_selector:` instead of `label_selectors:`), and the static
 test playbooks never run those tasks. This script reads every task in the
 given role task/handler/test files and playbooks and reports arguments that are
-neither an option nor an alias of the module (from `ansible-doc -j`).
+neither an option nor an alias of the module (from `ansible-doc -j`). Only
+top-level options are checked, not suboptions (e.g. keys inside a dict option).
 
 Usage (repo root, with the collections of requirements installed):
-  python3 scripts/check_module_args.py roles playbooks
-Exits 1 if any unknown argument or unresolvable module is found.
+  python3 scripts/check_module_args.py [PATH ...]
+PATH: a directory (its tasks/, handlers/, playbooks/ and tests/ YAML files) or
+a file. Default: roles playbooks (enterprise-ai-solutions); enterprise-rag
+passes deployment/roles deployment/backup.yaml.
+Exits 1 if any unknown argument or unresolvable module is found, if no module
+call is found, or if a PATH does not exist.
 """
 
 import json
@@ -42,6 +47,8 @@ def is_play(item):
 
 def task_files(paths):
     for p in map(pathlib.Path, paths):
+        if not p.exists():
+            sys.exit(f"{p}: no such file or directory")
         files = [p] if p.is_file() else sorted(list(p.rglob("*.yaml")) + list(p.rglob("*.yml")))
         for f in files:
             parts = set(f.parts)
@@ -54,7 +61,8 @@ def walk(tasks, found, unchecked):
         if not isinstance(t, dict):
             continue
         if "local_action" in t or "action" in t:
-            unchecked.append(str(t.get("local_action") or t.get("action")).split()[0])
+            action = str(t.get("local_action") or t.get("action") or "").split()
+            unchecked.append(action[0] if action else "?")
         for k in ("block", "rescue", "always"):
             walk(t.get(k), found, unchecked)
         for mod in (k for k in t if k not in KEYWORDS):
@@ -111,6 +119,9 @@ def main(argv):
             walk(data, found, unchecked)
         calls += [(f, *c) for c in found]
 
+    if not calls:
+        print(f"no module calls found under {argv or ['roles', 'playbooks']}")
+        return 1
     spec = options({mod for _, _, mod, _ in calls})
     problems = []
     for f, name, mod, args in calls:
@@ -118,8 +129,6 @@ def main(argv):
             problems.append(f"{f}: {name}: module '{mod}' not found by ansible-doc")
         elif args - spec[mod] - {"_raw_params"}:
             problems.append(f"{f}: {name}: {mod}: unknown argument(s) {sorted(args - spec[mod] - {'_raw_params'})}")
-    if not calls:
-        problems.append(f"no module calls found under {argv}")
     print("\n".join(sorted(problems)) or f"OK: {len(calls)} module calls, {len(spec)} modules")
     if unchecked:
         print(f"not checked (free-form or templated args): {len(unchecked)}", file=sys.stderr)

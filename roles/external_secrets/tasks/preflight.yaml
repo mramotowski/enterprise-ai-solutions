@@ -5,26 +5,12 @@
 # external_secrets — Preflight
 #
 # Included at the top of install and validate (and by the tests); teardown
-# does not need it (it finds its objects by label and CRD). Asserts and facts only: nothing here touches the
-# cluster. Resolves what the chart values, the ClusterSecretStores and the
-# admission policy need from the shared openbao_* keys (global_config.yaml) and
-# from the openbao role's defaults (role defaults are not visible across roles).
-
-- name: "external_secrets | Preflight — secrets_backend is openbao"
-  ansible.builtin.assert:
-    that:
-      - (secrets_backend | default('local', true)) == 'openbao'
-    fail_msg: >-
-      external_secrets is only used with secrets_backend: openbao
-      (got '{{ secrets_backend | default('local', true) }}').
-    quiet: true
-
-- name: "external_secrets | Preflight — openbao_mode is internal or external"
-  ansible.builtin.assert:
-    that:
-      - (openbao_mode | default('internal')) in ['internal', 'external']
-    fail_msg: "openbao_mode must be 'internal' or 'external' (got '{{ openbao_mode | default('') }}')."
-    quiet: true
+# does not need it (it finds its objects by label and CRD). Facts only: nothing
+# here touches the cluster. Resolves what the chart values, the
+# ClusterSecretStores and the admission policy need from the shared openbao_*
+# keys (global_config.yaml) and from the openbao role's defaults (role defaults
+# are not visible across roles). The openbao_* keys are validated once, before
+# any role, by the global preflight (playbooks/includes/preflight_secrets.yaml).
 
 # Read without letting include_vars precedence override an operator's value.
 - name: "external_secrets | Preflight — Load openbao defaults"
@@ -52,46 +38,6 @@
     _eso_cluster_id: "{{ openbao_cluster_id | default('', true) or env_name | default('') }}"
     _eso_audience: "{{ openbao_auth_audience | default('vault', true) | string }}"
     _eso_layers: "{{ openbao_layers | default([]) }}"
-
-- name: "external_secrets | Preflight — OpenBao connection keys"
-  vars:
-    _problems: >-
-      {{ (['openbao_address is empty (external mode: the https:// URL of your OpenBao)']
-          if _eso_external | bool and _eso_server | length == 0 else [])
-         + (['openbao_address (' ~ _eso_server ~ ') must be an https:// URL with only a host and an optional port']
-          if _eso_external | bool and _eso_server | length > 0
-             and _eso_server is not match('^https://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?$') else [])
-         + (['openbao_auth_mount (' ~ _eso_auth_mount ~ ') must be [A-Za-z0-9_-] segments separated by a single / or .']
-          if _eso_auth_mount is not match('^[A-Za-z0-9_-]+([./][A-Za-z0-9_-]+)*$') else [])
-         + (['openbao_kv_mount (' ~ _eso_kv_mount ~ ') must be a name of [A-Za-z0-9._-]']
-          if _eso_kv_mount is not match('^[A-Za-z0-9._-]+$') or _eso_kv_mount in ['.', '..'] else [])
-         + (['the cluster id (' ~ _eso_cluster_id ~ ', from openbao_cluster_id or the env name) must be a name of [A-Za-z0-9._-]']
-          if (_eso_cluster_id | string) is not match('^[A-Za-z0-9._-]+$') or _eso_cluster_id in ['.', '..'] else [])
-         + (['the cluster id must differ from openbao_kv_mount (' ~ _eso_kv_mount ~ '): the ESO vault provider strips a leading <mount>/ from every key']
-          if (_eso_cluster_id | string) == _eso_kv_mount else [])
-         + (['openbao_auth_audience must not be empty'] if _eso_audience | length == 0 else []) }}
-  ansible.builtin.assert:
-    that:
-      - _problems | length == 0
-    fail_msg: "external_secrets — {{ _problems | join('; ') }}."
-    quiet: true
-
-# Layer names end up in store names (DNS-1123 subdomain), in the namespace
-# label key and in the paths annotation key (label/annotation name part <= 63).
-- name: "external_secrets | Preflight — openbao_layers"
-  ansible.builtin.assert:
-    that:
-      - _eso_layers is sequence
-      - _eso_layers is not string
-      - _eso_layers is not mapping
-      - _eso_layers | length > 0
-      - _eso_layers | map('string') | select('match', '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$') | list | length == (_eso_layers | length)
-      - _eso_layers | map('string') | select('match', '^.{' ~ (64 - (external_secrets_paths_annotation_suffix | length)) ~ ',}$') | list | length == 0
-      - _eso_layers | unique | length == (_eso_layers | length)
-    fail_msg: >-
-      openbao_layers ({{ _eso_layers }}) must be a non-empty list of distinct lower-kebab layer names
-      of at most {{ 63 - (external_secrets_paths_annotation_suffix | length) }} characters.
-    quiet: true
 
 - name: "external_secrets | Preflight — Stores"
   ansible.builtin.set_fact:

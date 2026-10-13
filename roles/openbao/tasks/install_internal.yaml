@@ -124,6 +124,7 @@
         namespace: "{{ openbao_namespace }}"
       data:
         bootstrap.sh: "{{ lookup('ansible.builtin.file', 'bootstrap.sh') }}"
+        access.sh: "{{ lookup('ansible.builtin.file', 'access.sh') }}"
         tls-reload.sh: "{{ lookup('ansible.builtin.file', 'tls-reload.sh') }}"
 
 # The snapshot Job's namespace (backup hooks, tasks/snapshot_*.yaml): only what
@@ -141,16 +142,6 @@
           {{ {'pod-security.kubernetes.io/enforce': 'restricted',
               'pod-security.kubernetes.io/audit': 'restricted',
               'pod-security.kubernetes.io/warn': 'restricted'} if enforce_pss | default(false) | bool else {} }}
-  when: openbao_backup_namespace != openbao_namespace
-
-# Earlier installs created the snapshot ServiceAccount in openbao_namespace.
-- name: "openbao | Remove the snapshot ServiceAccount from {{ openbao_namespace }} (moved)"
-  kubernetes.core.k8s:
-    state: absent
-    api_version: v1
-    kind: ServiceAccount
-    name: "{{ openbao_backup_sa }}"
-    namespace: "{{ openbao_namespace }}"
   when: openbao_backup_namespace != openbao_namespace
 
 # The Kubernetes-auth roles 'operator' and 'backup' bind these (AD-7). Layer
@@ -215,14 +206,7 @@
   retries: "{{ openbao_pods_wait_retries }}"
   delay: "{{ openbao_pods_wait_delay }}"
 
-# ── Certificate reload, upgrade rollout ──────────────────────────────────────
-
-# Pods started before the current server certificate serve the old one until
-# SIGHUP (the tls-reloader sidecar does this too, once it runs in every pod).
-- name: "openbao | Serve the current listener certificate"
-  ansible.builtin.include_tasks: tls_reload.yaml
-  vars:
-    _openbao_tls_mode: reload-if-stale
+# ── Upgrade rollout ──────────────────────────────────────────────────────────
 
 # openbao_upgrade: restart pods on an old revision and unseal new ones, one at
 # a time; otherwise only report them.

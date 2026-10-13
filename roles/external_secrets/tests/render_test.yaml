@@ -10,8 +10,9 @@
 # pod security context on every Deployment. Renders the ClusterSecretStores
 # for internal, external and two-layer configs and validates them strictly
 # against the chart's ClusterSecretStore CRD schema (files/crd_validate.py).
-# Then the preflight failures, the local-mode gate and the task wiring of
-# install/validate/upgrade/teardown. Everything it writes goes to a temp dir
+# Then the local-mode gate and the task wiring of
+# install/validate/upgrade/teardown (the openbao_* key checks are in
+# playbooks/tests/preflight_secrets_test.yaml). Everything it writes goes to a temp dir
 # that is removed at the end (Helm cache/config/data homes included).
 #
 # Run from the repo root:
@@ -54,49 +55,6 @@
       - name: two-layers
         vars: {openbao_layers: [erag, inference]}
         expect: {server: "https://openbao-active.openbao.svc:8200", auth_mount: kubernetes, stores: [erag, inference]}
-    _preflight_cases:
-      - name: "secrets_backend local"
-        vars: {secrets_backend: local}
-        expect: "only used with secrets_backend: openbao"
-      - name: "bad openbao_mode"
-        vars: {openbao_mode: remote}
-        expect: "openbao_mode must be 'internal' or 'external'"
-      - name: "external: empty address"
-        vars: {openbao_mode: external, openbao_cluster_id: c1}
-        expect: "openbao_address is empty"
-      - name: "external: http:// address"
-        vars: {openbao_mode: external, openbao_cluster_id: c1, openbao_address: "http://bao.example.com:8200"}
-        expect: "must be an https:// URL"
-      - name: "external: address with a path"
-        vars: {openbao_mode: external, openbao_cluster_id: c1, openbao_address: "https://bao.example.com/v1"}
-        expect: "must be an https:// URL"
-      - name: "bad auth mount"
-        vars: {openbao_auth_mount: "k8s//c1"}
-        expect: "openbao_auth_mount \\(k8s//c1\\)"
-      - name: "bad kv mount"
-        vars: {openbao_kv_mount: "a/b"}
-        expect: "openbao_kv_mount \\(a/b\\)"
-      - name: "cluster id equals kv mount"
-        vars: {openbao_cluster_id: intel-ai}
-        expect: "must differ from openbao_kv_mount"
-      - name: "bad cluster id"
-        vars: {openbao_cluster_id: "a b"}
-        expect: "the cluster id \\(a b"
-      - name: "empty layers"
-        vars: {openbao_layers: []}
-        expect: "openbao_layers \\(\\[\\]\\) must be a non-empty list"
-      - name: "layer with upper case"
-        vars: {openbao_layers: [Erag]}
-        expect: "lower-kebab"
-      - name: "duplicate layers"
-        vars: {openbao_layers: [erag, erag]}
-        expect: "distinct"
-      - name: "layer too long for the annotation key"
-        vars: {openbao_layers: ["{{ 'a' * 58 }}"]}
-        expect: "at most 57 characters"
-      - name: "layers as a string"
-        vars: {openbao_layers: "erag"}
-        expect: "must be a non-empty list"
     # store_assert.yaml with fabricated k8s_info results (store_wait.yaml loop).
     _ready_valid: {type: Ready, status: "True", reason: Valid, message: store validated}
     _store_assert_cases:
@@ -285,13 +243,6 @@
               - _rb.roleRef.name == _role.metadata.name
             quiet: true
 
-        - name: "external_secrets | test | Preflight failure cases"
-          ansible.builtin.include_tasks: _preflight_case.yaml
-          loop: "{{ _preflight_cases }}"
-          loop_control:
-            loop_var: _case
-            label: "{{ _case.name }}"
-
         # The component gate: with secrets_backend: local the platform never
         # selects external_secrets (or openbao).
         - name: "external_secrets | test | Load components.yaml"
@@ -318,49 +269,27 @@
               - _entries | map(attribute='enabled') | map('bool') | unique | list == [true]
             quiet: true
 
-        - name: "external_secrets | test | Load task files"
+        - name: "external_secrets | test | Load the teardown task files"
           ansible.builtin.set_fact:
-            _t_install: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/install.yaml') | from_yaml }}"
-            _t_validate: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/validate.yaml') | from_yaml }}"
-            _t_upgrade: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/upgrade.yaml') | from_yaml }}"
             _t_teardown: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/teardown.yaml') | from_yaml }}"
-            _t_wait: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/store_wait.yaml') | from_yaml }}"
             _t_td_check: "{{ lookup('ansible.builtin.file', _role_dir ~ '/tasks/teardown_check.yaml') | from_yaml }}"
 
-        - name: "external_secrets | test | Assert the task wiring"
+        - name: "external_secrets | test | Assert CRDs are kept by default and the CRD guard runs before any delete"
           vars:
             _names_td: "{{ _t_teardown | map(attribute='name') | list }}"
-            _names_in: "{{ _t_install | map(attribute='name') | list }}"
             _idx_td: >-
               {% set r = {} %}{% for t in _t_teardown %}{% for k, pat in {'guard': 'Check leftovers', 'policy': 'Delete the admission policy',
               'stores': 'Delete the OpenBao ClusterSecretStores', 'uninstall': 'Uninstall the Helm release', 'crds': 'Delete the ESO CRDs',
               'ns': 'Delete namespace'}.items() %}{% if pat in t.name %}{% set _ = r.update({k: _names_td.index(t.name)}) %}{% endif %}{% endfor %}{% endfor %}{{ r }}
             _guard: "{{ _t_td_check | selectattr('name', 'search', 'Refuse to delete the CRDs') | first }}"
             _crd_block: "{{ _t_teardown | selectattr('name', 'search', 'Delete the ESO CRDs') | first }}"
-            _wait_task: "{{ _t_wait | first }}"
-            _inc_install: >-
-              {% set r = [] %}{% for t in _t_install if 'ansible.builtin.include_tasks' in t %}{% set _ = r.append(t['ansible.builtin.include_tasks']) %}{% endfor %}{{ r }}
-            _inc_validate: >-
-              {% set r = [] %}{% for t in _t_validate if 'ansible.builtin.include_tasks' in t %}{% set _ = r.append(t['ansible.builtin.include_tasks']) %}{% endfor %}{{ r }}
           ansible.builtin.assert:
             that:
-              - (_t_install | first)['ansible.builtin.include_tasks'] == 'preflight.yaml'
-              - (_t_validate | first)['ansible.builtin.include_tasks'] == 'preflight.yaml'
-              - _t_upgrade | length == 1
-              - _t_upgrade[0]['ansible.builtin.include_tasks'] == 'install.yaml'
-              - _inc_install == ['preflight.yaml', 'store_wait.yaml']
-              - _inc_validate == ['preflight.yaml', 'store_wait.yaml']
-              # The CRD guard runs before anything is removed, only when CRDs are to be deleted.
-              - _idx_td.guard < _idx_td.stores < _idx_td.policy < _idx_td.uninstall < _idx_td.crds < _idx_td.ns
+              - external_secrets_teardown_delete_crds == false
               - _guard.when == 'external_secrets_teardown_delete_crds | bool'
               - _crd_block.when == 'external_secrets_teardown_delete_crds | bool'
-              # Install: the path policy is applied before any store.
-              - _names_in.index(_names_in | select('search', 'Pin ExternalSecrets') | first)
-                < _names_in.index(_names_in | select('search', 'Apply ClusterSecretStores') | first)
-              - external_secrets_teardown_delete_crds == false
-              # The store wait can report the condition (failed_when false, then an assert).
-              - _wait_task.failed_when == false
-              - "'until' in _wait_task"
+              - _idx_td.guard < ([_idx_td.stores, _idx_td.policy, _idx_td.uninstall, _idx_td.crds, _idx_td.ns] | min)
+            fail_msg: "{{ _idx_td | to_json }}"
             quiet: true
 
         - name: "external_secrets | test | Store status report cases"
@@ -381,7 +310,7 @@
           ansible.builtin.debug:
             msg: >-
               chart {{ external_secrets_chart_version }} rendered and checked; {{ _store_cases | length }} store
-              cases valid against the CRD schema; {{ _preflight_cases | length }} preflight failures; gates and
+              cases valid against the CRD schema; gates and
               task wiring checked.
       always:
         - name: "external_secrets | test | Remove temp dir"

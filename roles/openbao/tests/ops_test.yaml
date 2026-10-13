@@ -6,11 +6,12 @@
 #
 # Server: quay.io/openbao/openbao:2.7.0 in Docker with a TLS listener (throwaway
 # CA, two server certs with SAN 127.0.0.1) and integrated Raft. Rows:
-#   tls check        the mounted leaf is served: current
-#   tls stale        tls.crt swapped (atomic rename, as the kubelet does): stale
-#   tls heal         reload-if-stale sends SIGHUP: reloaded, then current
-#   tls sidecar      `watch` in a second container sharing the server's PID and
-#                    network namespaces (the tls-reloader sidecar) heals a swap
+#   tls stale        tls.crt swapped (atomic rename, as the kubelet does): the
+#                    server keeps serving the old certificate (no auto-reload)
+#   tls sidecar      tls-reload.sh in a second container sharing the server's PID
+#                    and network namespaces (the tls-reloader sidecar): its start
+#                    SIGHUP heals the stale cert, a later swap is served within
+#                    the interval
 #   status fields    unsealed `bao status` has sealed/ha_enabled/leader_address
 #                    (what tasks/roll_pod.yaml waits for)
 #   snapshot save    snapshot.sh in a "Job" container (the caller's uid, so the
@@ -38,6 +39,11 @@
     _role_dir: "{{ playbook_dir | dirname }}"
     _image: "quay.io/openbao/openbao:2.7.0"
     _scripts: "/openbao/userconfig/openbao-bootstrap"
+    # Inside a server container: exit 0 only when it serves the mounted leaf
+    # (the first PEM block of /tls/tls.crt as the only trust anchor; sealed = rc 2).
+    _served_is_mounted: >-
+      awk '/BEGIN CERTIFICATE/{n++} n==1' /tls/tls.crt > /tmp/leaf;
+      bao status -ca-cert=/tmp/leaf >/dev/null 2>&1; r=$?; [ "$r" -eq 0 ] || [ "$r" -eq 2 ]
     # bao calls as the test's root token, inside a server container.
     _as_root: "export BAO_TOKEN=$(cat /tmp/rt); "
     _backup_policy: |
@@ -85,10 +91,6 @@
               cd {{ (_tmp.path ~ '/pki') | quote }}
               openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout ca.key -out ca.crt -subj /CN=ops-test-ca -days 1 2>/dev/null
               printf 'subjectAltName=IP:127.0.0.1\n' > ext
-              openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout ca2.key -out ca2.crt -subj /CN=ops-test-ca2 -days 1 2>/dev/null
-              openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout c.key -out c.csr -subj /CN=ops-test-c 2>/dev/null
-              openssl x509 -req -in c.csr -CA ca2.crt -CAkey ca2.key -CAcreateserial -out c.leaf -days 1 -extfile ext 2>/dev/null
-              cat c.leaf ca2.crt > c.crt
               for c in a b; do
                 openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout $c.key -out $c.csr -subj /CN=ops-test-$c 2>/dev/null
                 openssl x509 -req -in $c.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out $c.leaf -days 1 -extfile ext 2>/dev/null
@@ -159,13 +161,6 @@
           failed_when: false
 
         # ── TLS reload ──────────────────────────────────────────────────────
-        - name: "openbao | ops test | tls check (current)"
-          ansible.builtin.command:
-            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", check]
-          register: _t1
-          changed_when: false
-          failed_when: false
-
         - name: "openbao | ops test | Swap tls.crt/tls.key to cert b (atomic rename)"
           ansible.builtin.shell:
             cmd: |
@@ -175,71 +170,37 @@
               mv tls/.n.key tls/tls.key; mv tls/.n.crt tls/tls.crt
           changed_when: true
 
-        - name: "openbao | ops test | tls check after the swap (stale)"
+        - name: "openbao | ops test | tls stale: the old certificate is still served"
           ansible.builtin.command:
-            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", check]
-          register: _t2
+            argv: [docker, exec, "{{ _s1 }}", /bin/sh, -c, "{{ _served_is_mounted }}"]
+          register: _t1
           changed_when: false
-          failed_when: false
+          failed_when: _t1.rc == 0
 
-        - name: "openbao | ops test | reload-if-stale"
+        - name: "openbao | ops test | tls stale: the server still answers (unverified)"
           ansible.builtin.command:
-            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", reload-if-stale]
-          register: _t3
+            argv: [docker, exec, "{{ _s1 }}", bao, status, -tls-skip-verify]
+          register: _t1b
           changed_when: false
-          failed_when: false
-
-        - name: "openbao | ops test | tls check after the reload (current)"
-          ansible.builtin.command:
-            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", check]
-          register: _t4
-          changed_when: false
-          failed_when: false
-
-        - name: "openbao | ops test | Assert check / stale / reload"
-          ansible.builtin.assert:
-            that:
-              - _t1.rc == 0 and _t1.stdout == 'current'
-              - _t2.rc == 1 and _t2.stdout == 'stale'
-              - _t3.rc == 0 and _t3.stdout == 'reloaded'
-              - _t4.rc == 0 and _t4.stdout == 'current'
-            fail_msg: "{{ [_t1, _t2, _t3, _t4] | map(attribute='stdout') | list }} / {{ [_t1, _t2, _t3, _t4] | map(attribute='stderr') | list }}"
-            quiet: true
-
-        # A served certificate the mounted CA does not trust (rotated CA, or
-        # expired): still a server that answers, so stale, and reloaded.
-        - name: "openbao | ops test | Serve cert c (other CA), then mount a and b's CA bundle back"
-          ansible.builtin.shell:
-            cmd: |
-              set -eu
-              cd {{ _tmp.path | quote }}
-              cp pki/c.crt tls/.n.crt; cp pki/c.key tls/.n.key; chmod 0644 tls/.n.*
-              mv tls/.n.key tls/tls.key; mv tls/.n.crt tls/tls.crt
-              docker exec -e OB_TLS_DIR=/tls {{ _s1 | quote }} /bin/sh {{ (_scripts ~ '/tls-reload.sh') | quote }} reload-if-stale
-              cp pki/b.crt tls/.n.crt; cp pki/b.key tls/.n.key; chmod 0644 tls/.n.*
-              mv tls/.n.key tls/tls.key; mv tls/.n.crt tls/tls.crt
-              docker exec -e OB_TLS_DIR=/tls {{ _s1 | quote }} /bin/sh {{ (_scripts ~ '/tls-reload.sh') | quote }} check || true
-              docker exec -e OB_TLS_DIR=/tls {{ _s1 | quote }} /bin/sh {{ (_scripts ~ '/tls-reload.sh') | quote }} reload-if-stale
-          register: _tca
-          changed_when: true
-
-        - name: "openbao | ops test | tls check with a certificate from a rotated CA"
-          ansible.builtin.assert:
-            that:
-              # c is served after the first reload; with b mounted (the CA that does not
-              # sign c), c is stale, not unreachable, and the reload fixes it.
-              - _tca.stdout_lines == ['reloaded', 'stale', 'reloaded']
-            fail_msg: "{{ _tca.stdout_lines }} {{ _tca.stderr }}"
-            quiet: true
+          failed_when: _t1b.rc not in [0, 2]
 
         - name: "openbao | ops test | Start the reloader sidecar (shared PID and network namespace)"
           ansible.builtin.command:
             argv: [docker, run, -d, --name, "{{ _side }}", --pid, "container:{{ _s1 }}", --network, "container:{{ _s1 }}",
                    --user, "100:1000", --read-only, --tmpfs, /tmp, --cap-drop, ALL, --security-opt, no-new-privileges,
-                   -e, OB_TLS_DIR=/tls, -e, OB_TLS_INTERVAL=5, -e, HOME=/tmp,
+                   -e, OB_TLS_DIR=/tls, -e, OB_TLS_INTERVAL=5,
                    -v, "{{ _tmp.path }}/tls:/tls:ro", -v, "{{ _role_dir }}/files:{{ _scripts }}:ro",
-                   --entrypoint, /bin/sh, "{{ _image }}", "{{ _scripts }}/tls-reload.sh", watch]
+                   --entrypoint, /bin/sh, "{{ _image }}", "{{ _scripts }}/tls-reload.sh"]
           changed_when: true
+
+        - name: "openbao | ops test | Wait for the sidecar's start SIGHUP to serve cert b"
+          ansible.builtin.command:
+            argv: [docker, exec, "{{ _s1 }}", /bin/sh, -c, "{{ _served_is_mounted }}"]
+          register: _t2
+          until: _t2.rc == 0
+          retries: 15
+          delay: 1
+          changed_when: false
 
         - name: "openbao | ops test | Swap back to cert a"
           ansible.builtin.shell:
@@ -250,32 +211,40 @@
               mv tls/.n.key tls/tls.key; mv tls/.n.crt tls/tls.crt
           changed_when: true
 
-        - name: "openbao | ops test | Wait for the sidecar to reload"
+        # Within the interval (5 s) plus slack.
+        - name: "openbao | ops test | Wait for the sidecar to serve cert a"
           ansible.builtin.command:
-            argv: [docker, exec, -e, OB_TLS_DIR=/tls, "{{ _s1 }}", /bin/sh, "{{ _scripts }}/tls-reload.sh", check]
-          register: _t5
-          until: _t5.stdout == 'current'
-          retries: 15
-          delay: 2
+            argv: [docker, exec, "{{ _s1 }}", /bin/sh, -c, "{{ _served_is_mounted }}"]
+          register: _t3
+          until: _t3.rc == 0
+          retries: 12
+          delay: 1
           changed_when: false
-          failed_when: false
 
-        # The sidecar logs once it has confirmed the reload (up to a second later).
+        # Idle at least two intervals, then count until two reads agree.
+        - name: "openbao | ops test | Sidecar SIGHUP count once settled"
+          ansible.builtin.shell:
+            cmd: |
+              n() { docker logs {{ _side | quote }} 2>&1 | grep -c 'sent SIGHUP to'; }
+              sleep 11; a=$(n); sleep 6; b=$(n); echo "$a $b"
+          register: _side_count
+          until: (_side_count.stdout.split() | unique | length) == 1
+          retries: 3
+          delay: 1
+          changed_when: false
+
         - name: "openbao | ops test | Sidecar log"
           ansible.builtin.command:
             argv: [docker, logs, "{{ _side }}"]
           register: _side_log
-          until: _side_log.stderr is search('now serves the mounted one')
-          retries: 10
-          delay: 1
           changed_when: false
 
-        - name: "openbao | ops test | Assert the sidecar healed the swap"
+        - name: "openbao | ops test | Assert the sidecar signalled exactly once per certificate"
           ansible.builtin.assert:
             that:
-              - _t5.stdout == 'current'
-              - _side_log.stderr is search('sent SIGHUP to [0-9]+ and it now serves the mounted one')
-            fail_msg: "check={{ _t5.stdout }} sidecar: {{ _side_log.stderr }}"
+              - _side_count.stdout == '2 2'
+              - _side_log.stderr | regex_findall('sent SIGHUP to [0-9]+; the mounted certificate is served') | length == 2
+            fail_msg: "count={{ _side_count.stdout }} sidecar: {{ _side_log.stderr }}"
             quiet: true
 
         - name: "openbao | ops test | Stop the sidecar"

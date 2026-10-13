@@ -83,8 +83,8 @@ openbao_backup_namespace: "openbao-backup"
 openbao_init_timeout: 120
 # kubernetes_host of auth/kubernetes (token reviews go to the in-cluster API).
 openbao_k8s_host: "https://kubernetes.default.svc"
-# ConfigMap holding files/bootstrap.sh, mounted read-only into the server pods
-# (chart extraVolumes: /openbao/userconfig/<name>/).
+# ConfigMap holding files/bootstrap.sh and the access.sh it sources, mounted
+# read-only into the server pods (chart extraVolumes: /openbao/userconfig/<name>/).
 openbao_bootstrap_configmap: "openbao-bootstrap"
 openbao_bootstrap_script_path: "/openbao/userconfig/{{ openbao_bootstrap_configmap }}/bootstrap.sh"
 # The k8s_exec command for tasks/bootstrap_exec.yaml (evaluated lazily with
@@ -124,9 +124,8 @@ openbao_audit_path: "file"
 # --- Server certificate reload (files/tls-reload.sh) ----------------------------
 # OpenBao reads tls_cert_file only at start and on SIGHUP. The sidecar
 # 'tls-reloader' (same image, shared process namespace, no ports, no API rights)
-# compares the served certificate with the mounted one every interval seconds
-# and sends SIGHUP to the bao server process when cert-manager renewed it.
-# Install and upgrade also heal every pod once; validate fails on a stale one.
+# hashes the mounted tls.crt every interval seconds (min 5) and sends SIGHUP to
+# the bao server process once after start and whenever the hash changed.
 openbao_tls_reloader_enabled: true
 openbao_tls_reloader_interval: 60
 openbao_tls_reload_script_path: "/openbao/userconfig/{{ openbao_bootstrap_configmap }}/tls-reload.sh"

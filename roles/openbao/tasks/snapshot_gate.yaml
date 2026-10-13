@@ -37,9 +37,8 @@
       # backup (the live Raft volumes) and replays the chart's objects.
       - openbao_backup_namespace != openbao_namespace
       - openbao_snapshot_pvc is match(_label)
-      - openbao_auth_audience | default('') | length > 0
     fail_msg: >-
       openbao snapshot hook: openbao_backup_namespace ('{{ openbao_backup_namespace }}') must be a
       DNS-1123 label other than openbao_namespace ('{{ openbao_namespace }}'), openbao_snapshot_pvc
-      ('{{ openbao_snapshot_pvc }}') a DNS-1123 label, and openbao_auth_audience set.
+      ('{{ openbao_snapshot_pvc }}') a DNS-1123 label.
     quiet: true

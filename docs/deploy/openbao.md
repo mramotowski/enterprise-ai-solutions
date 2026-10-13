@@ -230,23 +230,26 @@ until you confirm that the peers were removed:
 cert-manager renews the server certificate (`openbao-server-tls`, 1 year, renewed 30
 days before expiry), and the kubelet updates the mounted files. OpenBao, however,
 reads its listener certificate only at start and on SIGHUP. The `tls-reloader`
-sidecar in every server pod (`openbao_tls_reloader_enabled`, default `true`) checks
-every `openbao_tls_reloader_interval` seconds (60) whether the served certificate is
-the mounted one, and sends SIGHUP to the `bao server` process when it is not. A SIGHUP
-does not seal OpenBao and does not interrupt requests. Every install and upgrade also
-reloads any pod that serves an old certificate, and `validate` fails while one does.
+sidecar in every server pod (`openbao_tls_reloader_enabled`, default `true`) hashes
+the mounted `tls.crt` every `openbao_tls_reloader_interval` seconds (60) and sends
+SIGHUP to the `bao server` process once after it starts and whenever the hash changed,
+until the listener serves the mounted certificate. A SIGHUP does not seal OpenBao
+and does not interrupt requests. After an installer update that changes the sidecar
+(its command or env), run the upgrade ([Upgrades](#upgrades)) so that the pods
+restart with the new sidecar.
 
 The sidecar shares the pod's process namespace (it has to, to signal the server).
 It runs the server image as the same non-root user, with no ports and no Kubernetes
 API rights; its script reads only the public certificate files. See
-[Limitations](#limitations) for what the shared namespace exposes. Pods created
-before the sidecar existed get it at their next restart: run the upgrade.
+[Limitations](#limitations) for what the shared namespace exposes.
 
-To reload by hand (for example with `openbao_tls_reloader_enabled: false`):
+To reload by hand (for example with `openbao_tls_reloader_enabled: false`), after
+every renewal:
 
 ```bash
-kubectl -n openbao exec openbao-0 -c openbao -- /bin/sh /openbao/userconfig/openbao-bootstrap/tls-reload.sh reload-if-stale
-# prints current | reloaded | failed; repeat for every pod
+kubectl -n openbao exec openbao-0 -c openbao -- sh -c \
+  'for p in $(pidof bao); do tr "\000" " " </proc/$p/cmdline | grep -Eq "(^|/)bao server" && kill -HUP $p; done'
+# repeat for every pod; or restart the pods one at a time and unseal each
 ```
 
 ## Operator login
@@ -303,15 +306,14 @@ unset enc otp a b
 
 # 4. Make the change. To restore, complete or extend the installer's bootstrap
 #    (a missing role, policy, KV mount or auth/kubernetes; a new layer in
-#    openbao_layers; the operator policy's sudo on sys/audit; role 'backup' moved to
-#    namespace openbao-backup), pipe the token into the bootstrap's apply mode.
+#    openbao_layers), pipe the token into the bootstrap's apply mode.
 #    The installer prints the exact command (with this env's values) when it finds
 #    missing bootstrap markers; it looks like this:
 printf '%s\n' "$BAO_TOKEN" | env OB_KV_MOUNT=intel-ai OB_CLUSTER_ID=<cluster_id> ... \
   /bin/sh /openbao/userconfig/openbao-bootstrap/bootstrap.sh apply erag:erag-secrets:erag-secrets-worker
 #    It creates what is missing (it never replaces a mount or auth method of the
-#    wrong type), rewrites every policy and role, reads them back, checks the audit
-#    device, prints one JSON line ("state":"applied") and revokes the token.
+#    wrong type), rewrites every policy and role, checks the audit device and the
+#    bootstrap markers, prints one JSON line ("state":"applied") and revokes the token.
 #    Other changes by hand, for example:
 bao policy list
 bao read auth/kubernetes/role/erag-secrets-worker
@@ -459,153 +461,10 @@ export CLUSTER_ID=cluster-a AUTH_MOUNT=kubernetes \
 sh roles/openbao/files/external-template.sh
 ```
 
-The script is `roles/openbao/files/external-template.sh`; it is reproduced here:
-
-<!-- external-template:begin -->
-```sh
-#!/bin/sh
-# OpenBao setup for one cluster with openbao_mode: external.
-# The same mount, auth, policies and roles as roles/openbao/files/bootstrap.sh
-# (internal mode), for an OpenBao you run. Run it as an OpenBao administrator:
-# BAO_ADDR, BAO_CACERT and a token allowed to manage mounts, auth methods,
-# policies and audit devices (bao login, or BAO_TOKEN) must be set.
-# Safe to re-run: existing mounts are checked, policies and roles rewritten.
-set -eu
-
-# --- Must match the cluster's env/<env>/global_config.yaml --------------------
-CLUSTER_ID=${CLUSTER_ID:?set CLUSTER_ID to openbao_cluster_id}
-KV_MOUNT=${KV_MOUNT:-intel-ai}                 # openbao_kv_mount
-AUTH_MOUNT=${AUTH_MOUNT:-kubernetes}           # openbao_auth_mount, one per cluster
-AUDIENCE=${AUDIENCE:-vault}                    # openbao_auth_audience
-# <layer>:<worker namespace>:<worker ServiceAccount> per layer in openbao_layers
-# (erag: erag_secrets_namespace, erag_secrets_worker_sa), space-separated.
-LAYERS=${LAYERS:-erag:erag-secrets:erag-secrets-worker}
-ESO_SA=${ESO_SA:-external-secrets}             # ESO controller ServiceAccount
-ESO_NAMESPACE=${ESO_NAMESPACE:-external-secrets}
-OPERATOR_SA=${OPERATOR_SA:-openbao-operator}   # created by the installer
-OPERATOR_NAMESPACE=${OPERATOR_NAMESPACE:-openbao}
-OPERATOR_TOKEN_TTL=${OPERATOR_TOKEN_TTL:-1h}
-
-# --- The cluster's API, called by OpenBao for TokenReview ---------------------
-K8S_HOST=${K8S_HOST:?set K8S_HOST to the cluster API URL reachable from OpenBao}
-K8S_CA_FILE=${K8S_CA_FILE:?set K8S_CA_FILE to the cluster API CA (PEM file)}
-# File with the JWT of a ServiceAccount bound to ClusterRole system:auth-delegator.
-# Empty: OpenBao reviews each client's own JWT, so every client ServiceAccount
-# then needs system:auth-delegator.
-REVIEWER_JWT_FILE=${REVIEWER_JWT_FILE:-}
-# 1: overwrite an auth/$AUTH_MOUNT/config that points at another cluster's API.
-FORCE=${FORCE:-0}
-
-# Policies are global in OpenBao: prefix them with the cluster id.
-c=$CLUSTER_ID
-m=$KV_MOUNT
-a=$AUTH_MOUNT
-flat() { tr -d ' \n\r\t'; }
-die() { printf 'external-template: %s\n' "$*" >&2; exit 1; }
-
-for spec in $LAYERS; do
-	case "$spec" in
-	*:*:*:* | :* | *::* | *:) die "bad LAYERS entry '$spec' (<layer>:<namespace>:<serviceaccount>)" ;;
-	*:*:*) ;;
-	*) die "bad LAYERS entry '$spec' (<layer>:<namespace>:<serviceaccount>)" ;;
-	esac
-done
-
-# 1. KV v2 mount (shared by every cluster; paths are <mount>/<kind>/<cluster_id>/...)
-if bao secrets list -format=json | flat | grep -qF "\"$m/\":{"; then
-	info=$(bao read -format=json "sys/mounts/$m" | flat)
-	case "$info" in *'"type":"kv"'*'"version":"2"'* | *'"version":"2"'*'"type":"kv"'*) ;;
-	*) die "mount $m/ exists but is not KV version 2" ;;
-	esac
-else
-	bao secrets enable -path="$m" -version=2 kv
-fi
-
-# 2. Kubernetes auth for this cluster
-if bao auth list -format=json | flat | grep -qF "\"$a/\":{"; then
-	case "$(bao read -format=json "sys/auth/$a" | flat)" in *'"type":"kubernetes"'*) ;;
-	*) die "auth/$a exists but is not a kubernetes auth method" ;;
-	esac
-else
-	bao auth enable -path="$a" kubernetes
-fi
-# On a shared OpenBao the mount may already serve another cluster: never repoint it silently.
-old_host=$(bao read -format=json "auth/$a/config" 2>/dev/null | flat | sed -n 's/.*"kubernetes_host":"\([^"]*\)".*/\1/p')
-if [ -n "$old_host" ] && [ "$old_host" != "$K8S_HOST" ] && [ "$FORCE" != 1 ]; then
-	die "auth/$a/config points at $old_host, not $K8S_HOST: use another AUTH_MOUNT for this cluster, or FORCE=1 to overwrite"
-fi
-if [ -n "$REVIEWER_JWT_FILE" ]; then
-	bao write "auth/$a/config" kubernetes_host="$K8S_HOST" kubernetes_ca_cert=@"$K8S_CA_FILE" \
-		token_reviewer_jwt=@"$REVIEWER_JWT_FILE" disable_local_ca_jwt=true
-else
-	bao write "auth/$a/config" kubernetes_host="$K8S_HOST" kubernetes_ca_cert=@"$K8S_CA_FILE" \
-		disable_local_ca_jwt=true
-fi
-
-# 3. Per layer: ESO (read), worker (read/write/delete), importer (migration)
-for spec in $LAYERS; do
-	l=${spec%%:*}
-	rest=${spec#*:}
-	wns=${rest%%:*}
-	wsa=${rest#*:}
-
-	bao policy write "$c-eso-$l" - <<EOF
-path "$m/data/$c/$l/*" {
-  capabilities = ["read"]
-}
-EOF
-	bao write "auth/$a/role/eso-$l" \
-		bound_service_account_names="$ESO_SA" bound_service_account_namespaces="$ESO_NAMESPACE" \
-		token_policies="$c-eso-$l" audience="$AUDIENCE"
-
-	bao policy write "$c-$l-secrets-worker" - <<EOF
-path "$m/data/$c/$l/*" {
-  capabilities = ["create", "update", "read", "delete"]
-}
-path "$m/metadata/$c/$l/*" {
-  capabilities = ["read", "list", "delete"]
-}
-EOF
-	bao write "auth/$a/role/$l-secrets-worker" \
-		bound_service_account_names="$wsa" bound_service_account_namespaces="$wns" \
-		token_policies="$c-$l-secrets-worker" audience="$AUDIENCE"
-
-	bao policy write "$c-$l-secrets-importer" - <<EOF
-path "$m/data/$c/$l/*" {
-  capabilities = ["create", "update", "read"]
-}
-EOF
-	bao write "auth/$a/role/$l-secrets-importer" \
-		bound_service_account_names="$l-secrets-importer" bound_service_account_namespaces="$wns" \
-		token_policies="$c-$l-secrets-importer" audience="$AUDIENCE"
-done
-
-# 4. Operator (people, and the installer's read-only checks). '+' is one path
-#    segment (data, metadata); listing audit devices needs sudo on sys/audit.
-bao policy write "$c-operator" - <<EOF
-path "$m/+/$c/*" {
-  capabilities = ["read", "create", "update", "list"]
-}
-path "sys/audit" {
-  capabilities = ["read", "sudo"]
-}
-EOF
-bao write "auth/$a/role/operator" \
-	bound_service_account_names="$OPERATOR_SA" bound_service_account_namespaces="$OPERATOR_NAMESPACE" \
-	token_policies="$c-operator" audience="$AUDIENCE" \
-	token_ttl="$OPERATOR_TOKEN_TTL" token_max_ttl="$OPERATOR_TOKEN_TTL"
-
-# 5. Audit device (AD-18): at least one must be enabled. OpenBao 2.7 refuses
-#    audit devices created through the API: declare one in the server config,
-#    e.g. audit "file" "file" { options { file_path = "stdout" } }.
-audit=$(bao audit list -format=json 2>/dev/null) || die "cannot list audit devices (needs sudo on sys/audit)"
-if ! printf '%s' "$audit" | flat | grep -q '"type":'; then
-	bao audit enable -path=file file file_path=stdout >/dev/null 2>&1 ||
-		die "no audit device is enabled: declare one in the OpenBao server configuration (audit \"file\" \"file\" { options { file_path = \"stdout\" } }), restart, and re-run"
-fi
-echo "OpenBao is set up for cluster '$c' (auth/$a, KV $m/)."
-```
-<!-- external-template:end -->
+The script is `roles/openbao/files/external-template.sh`. It sources
+`roles/openbao/files/access.sh` from its own directory (the same mount, policy and
+role writes as the internal bootstrap), so run it from a checkout of this repo, or
+copy both files into one directory. Its header lists every variable and default.
 
 If no audit device is enabled, the template tries `bao audit enable`. OpenBao 2.7
 refuses audit devices created through the API, so it then stops: declare the device
@@ -838,22 +697,13 @@ validate passes. Without the original shares the snapshot cannot be used.
   send the signal, which PSS restricted forbids. The sidecar runs only `tls-reload.sh`
   from the role's ConfigMap, in the pinned server image, with no ports and no API
   rights, so this matters only if that image or ConfigMap is compromised. Set
-  `openbao_tls_reloader_enabled: false` to drop it. Installs, upgrades and validate
-  still detect and fix a stale certificate.
-- Installs bootstrapped before the snapshot namespace existed bind role `backup` to
-  namespace `openbao`. The snapshot Job runs in `openbao-backup`, so its login fails
-  until you run the apply mode once
-  ([Change the bootstrap (generate-root)](#change-the-bootstrap-generate-root)). Run
-  apply only when every pod in `openbao_replicas` runs and is unsealed: it checks every
-  expected pod first.
+  `openbao_tls_reloader_enabled: false` to drop it; a renewed certificate is then
+  served only after a manual SIGHUP or a pod restart
+  ([Server certificate renewal](#server-certificate-renewal)).
 - The route allowlist relies on Envoy Gateway's default path normalization (RFC 3986,
   merged slashes): a request such as `/v1/intel-ai/../sys/generate-root` is matched as
   `/v1/sys/generate-root` and gets a 404. This was not verified against a running
   gateway.
-- Installs bootstrapped before the `sudo` capability was added to the `operator`
-  policy keep `["read"]` on `sys/audit`, which cannot list audit devices. Update the
-  policy with a temporary root token
-  ([Change the bootstrap (generate-root)](#change-the-bootstrap-generate-root)).
 - External mode checks roles by name and the KV mount and audit device with the
   operator token. It does not read the other roles' bindings or policies.
 - The CA bundle ConfigMap is refreshed on every install. After the internal CA is
@@ -865,6 +715,3 @@ validate passes. Without the original shares the snapshot cannot be used.
   namespace at sync time. Delete stale ExternalSecrets yourself.
 - The cluster id must differ from `openbao_kv_mount`: the ESO `vault` provider strips
   a leading `<mount>/` from every key. Preflight rejects that combination.
-- Internal installs made before the CA bundle existed need one
-  `./es_auto_installer.sh install platform --env <env>` re-run before `validate`
-  passes: `validate` requires ConfigMap `openbao-ca-bundle`, which the install creates.

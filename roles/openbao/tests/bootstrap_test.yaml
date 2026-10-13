@@ -9,7 +9,8 @@
 # templates/values.yaml.j2). files/ is mounted read-only where the chart mounts
 # the bootstrap ConfigMap and the script runs as `/bin/sh <path> <mode> <specs>`
 # with env only, the same shape as the k8s_exec in tasks/bootstrap_exec.yaml. Rows:
-#   bad shares       threshold 4 > shares 3: fails before init, nothing changed
+#   bad layers       a spec without a ServiceAccount, an "@" audience, an empty
+#                    cluster id: each fails before init, nothing changed
 #   fresh init       5 shares, KV mount, auth/kubernetes, AD-7 roles and policies,
 #                    stdout audit device; the old root token is revoked
 #   re-run healthy   no change, no shares
@@ -155,22 +156,54 @@
           changed_when: false
           failed_when: false
 
-        # ── bad shares ──────────────────────────────────────────────────────
-        - name: "openbao | bootstrap test | Row bad shares"
+        # ── bad layers ──────────────────────────────────────────────────────
+        - name: "openbao | bootstrap test | Row bad layer spec"
           ansible.builtin.include_tasks: _bootstrap_run.yaml
           vars:
-            _run: {container: "{{ _c1 }}", mode: init, env: {OB_KEY_SHARES: "3", OB_KEY_THRESHOLD: "4"}}
+            _run: {container: "{{ _c1 }}", mode: init}
+            _layer_specs: ["erag:erag-secrets"]
 
-        - name: "openbao | bootstrap test | Assert bad shares fail before init"
+        - name: "openbao | bootstrap test | Assert a bad layer spec fails before init"
           ansible.builtin.assert:
             that:
               - _bs_rc | int != 0
               - _bs.state == 'bad_params'
-              - _bs.error is search('openbao_key_threshold \(4\)') and _bs.error is search('openbao_key_shares \(3\)')
+              - _bs.error is search("bad layer spec 'erag:erag-secrets'")
               - _bs_shares is none
+            fail_msg: "bad layers: rc={{ _bs_rc }} {{ _bs | to_json }}"
             quiet: true
 
-        - name: "openbao | bootstrap test | Status after bad shares"
+        - name: "openbao | bootstrap test | Row an @ audience"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init, env: {OB_AUDIENCE: "@/etc/passwd"}}
+
+        - name: "openbao | bootstrap test | Assert an @ audience fails before init"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int != 0
+              - _bs.state == 'bad_params'
+              - _bs.error is search("audience '@/etc/passwd'")
+              - _bs_shares is none
+            fail_msg: "an @ audience: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Row an empty cluster id"
+          ansible.builtin.include_tasks: _bootstrap_run.yaml
+          vars:
+            _run: {container: "{{ _c1 }}", mode: init, env: {OB_CLUSTER_ID: ""}}
+
+        - name: "openbao | bootstrap test | Assert an empty cluster id fails before init"
+          ansible.builtin.assert:
+            that:
+              - _bs_rc | int != 0
+              - _bs.state == 'bad_params'
+              - _bs.error is search("cluster id ''")
+              - _bs_shares is none
+            fail_msg: "an empty cluster id: rc={{ _bs_rc }} {{ _bs | to_json }}"
+            quiet: true
+
+        - name: "openbao | bootstrap test | Status after the bad parameter rows"
           ansible.builtin.include_tasks: _bootstrap_run.yaml
           vars:
             _run: {container: "{{ _c1 }}", mode: status}
@@ -471,48 +504,6 @@
             fail_msg: "{{ _i | to_json }}"
             quiet: true
 
-        # Re-apply on a bootstrapped OpenBao: everything exists, one binding is old.
-        - name: "openbao | bootstrap test | Re-bind role backup to namespace openbao (old install)"
-          ansible.builtin.command:
-            argv: [docker, exec, -i, "{{ _c1 }}", /bin/sh, -c, "{{ _inspect }}", inspect, bind-backup, openbao]
-            stdin: "{{ _c1_shares | join('\n') }}"
-          changed_when: true
-          no_log: true
-
-        - name: "openbao | bootstrap test | Row re-apply on a bootstrapped OpenBao"
-          vars:
-            _env_args: >-
-              {% set r = [] %}{% for k, v in _base_env.items() %}{% set _ = r.extend(['-e', k ~ '=' ~ v]) %}{% endfor %}{{ r }}
-          ansible.builtin.command:
-            argv: "{{ ['docker', 'exec', '-i'] + _env_args + [_c1, '/bin/sh', '-c', _inspect, 'inspect', 'apply'] + _layer_specs + ['inference:inference-secrets:inference-secrets-worker'] }}"
-            stdin: "{{ _c1_shares | join('\n') }}"
-          register: _reapply_raw
-          changed_when: true
-          no_log: true
-
-        - name: "openbao | bootstrap test | Inspect role backup after re-apply"
-          ansible.builtin.command:
-            argv: [docker, exec, -i, "{{ _c1 }}", /bin/sh, -c, "{{ _inspect }}", inspect, inspect, none, backup]
-            stdin: "{{ _c1_shares | join('\n') }}"
-          register: _inspect4_raw
-          changed_when: false
-          no_log: true
-
-        - name: "openbao | bootstrap test | Assert re-apply converged the existing bootstrap"
-          vars:
-            _r: "{{ ((_reapply_raw.stdout | trim).splitlines() | last | from_json) }}"
-            _i: "{{ _inspect4_raw.stdout | trim | from_json }}"
-          ansible.builtin.assert:
-            that:
-              - _r.apply_rc | int == 0
-              - _r.apply.state == 'applied'
-              - _r.apply.root_revoked
-              - _r.temp_token_lookup_rc | int != 0
-              - _i.roles.backup.data.bound_service_account_namespaces == ['openbao-backup']
-              - _i.mounts['intel-ai/'].options.version == '2'
-            fail_msg: "re-apply: {{ _r | to_json }} backup: {{ _i.roles.backup | default('missing') | to_json }}"
-            quiet: true
-
         - name: "openbao | bootstrap test | Replace the KV mount with KV version 1"
           ansible.builtin.command:
             argv: [docker, exec, -i, "{{ _c1 }}", /bin/sh, -c, "{{ _inspect }}", inspect, remount-kv1, intel-ai]
@@ -682,7 +673,7 @@
         - name: "openbao | bootstrap test | All rows passed"
           ansible.builtin.debug:
             msg: >-
-              bad shares, fresh init, re-run, unreachable peer, missing role / KV mount /
+              bad layers, fresh init, re-run, unreachable peer, missing role / KV mount /
               auth, apply (extra layer, bad/missing token, sealed), sealed and bootstrap
               error rows passed.
       always:

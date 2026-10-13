@@ -1,9 +1,10 @@
 ---
 name: Ansible playbook tests
 
-# Runs the offline Ansible test playbooks of the openbao and external_secrets
-# roles (no cluster: helm template against the pinned charts, OpenBao 2.7.0 in
-# Docker, the Kubernetes API server's admission code built with Go). One job per
+# Runs the offline Ansible test playbooks of the global secrets preflight and
+# of the openbao and external_secrets roles (no cluster: helm template against
+# the pinned charts, OpenBao 2.7.0 in Docker, the Kubernetes API server's
+# admission code built with Go). One job per
 # entry playbook, so a regression fails only its job. Each job runs the command
 # from the playbook's header comment. A separate job checks the module
 # arguments of every task (scripts/check_module_args.py).
@@ -50,6 +51,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: preflight secrets settings
+            playbook: playbooks/tests/preflight_secrets_test.yaml
+            helm: false
+            go: false
+            images: ""
+            timeout: 10
           - name: openbao render
             playbook: roles/openbao/tests/render_test.yaml
             helm: true
@@ -162,6 +169,9 @@ jobs:
   # Unknown module arguments (e.g. k8s_info label_selector instead of
   # label_selectors) pass ansible-lint and the static tests above, and fail
   # only on a live run. Checks every task with mapping args against ansible-doc.
+  # ansible-lint's args rule (checked with kubernetes.core installed) passes the
+  # fixture's label_selector on k8s_info and fail_mesg on assert; only
+  # syntax-check catches its include_tasks typo. Hence this separate check.
   module-args:
     name: "Module arguments"
     runs-on: ubuntu-24.04
@@ -192,13 +202,19 @@ jobs:
             -p "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
           ansible-galaxy collection list kubernetes.core
 
-      # The fixture has three unknown arguments: the check must fail on it.
+      # The fixture has three unknown arguments: the check must fail on it,
+      # report exactly those three and resolve every module.
       - name: Self-test of the check
         run: |
-          if python3 scripts/check_module_args.py scripts/testdata/check_module_args; then
-            echo "check_module_args.py did not report the fixture's unknown arguments"
-            exit 1
-          fi
+          out="$(python3 scripts/check_module_args.py scripts/testdata/check_module_args 2>&1)" && rc=0 || rc=$?
+          echo "${out}"
+          fail() { echo "check_module_args.py self-test: $1"; exit 1; }
+          [ "${rc}" -ne 0 ] || fail "exit 0 on the fixture"
+          [ "$(grep -c 'unknown argument' <<<"${out}" || true)" -eq 3 ] || fail "expected 3 unknown argument lines"
+          for arg in label_selector fail_mesg task_from; do
+            grep -q "unknown argument(s) \['${arg}'\]" <<<"${out}" || fail "${arg} not reported"
+          done
+          if grep -q 'not found' <<<"${out}"; then fail "a module was not found"; fi
 
       - name: Check module arguments
         run: python3 scripts/check_module_args.py roles playbooks

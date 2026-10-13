@@ -2,7 +2,8 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# openbao — shared openbao_mode check (preflight, validate, teardown).
+# openbao — the one openbao_mode check: the global preflight
+# (playbooks/includes/preflight_secrets.yaml), teardown and upgrade.
 
 - name: "openbao | Preflight — openbao_mode is internal or external"
   ansible.builtin.assert:

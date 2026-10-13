@@ -221,7 +221,7 @@
           - _side | length == (1 if _reloader else 0)
           - (_pod.shareProcessNamespace | default(false)) == _reloader
           - not _reloader or _side[0].image == _ctr.image
-          - not _reloader or _side[0].command == ['/bin/sh', openbao_tls_reload_script_path, 'watch']
+          - not _reloader or _side[0].command == ['/bin/sh', openbao_tls_reload_script_path]
           - not _reloader or _side[0].ports is not defined
           - not _reloader or _side[0].securityContext.readOnlyRootFilesystem
           - not _reloader or _side[0].securityContext.runAsNonRoot
@@ -232,6 +232,7 @@
           - not _reloader or (_sm | selectattr('mountPath', 'eq', openbao_tls_reload_script_path | dirname) | map(attribute='readOnly') | list == [true])
           - not _reloader or (_sm | rejectattr('readOnly', 'defined') | map(attribute='mountPath') | list == ['/tmp'])
           - not _reloader or (_side[0].env | selectattr('name', 'eq', 'OB_TLS_DIR') | map(attribute='value') | list == [openbao_tls_mount_dir])
+          - not _reloader or (_side[0].env | map(attribute='name') | sort == ['OB_TLS_DIR', 'OB_TLS_INTERVAL'])
           - not _reloader or (_pod.volumes | selectattr('name', 'eq', 'tls-reloader-tmp') | list | length == 1)
           # The reloader's mounts are volumes the chart created.
           - not _reloader or (_sm | map(attribute='name') | reject('in', _pod.volumes | map(attribute='name') | list) | list | length == 0)

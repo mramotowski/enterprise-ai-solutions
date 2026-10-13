@@ -183,6 +183,16 @@
     quiet: true
   when: (secrets_backend | default('local')) == 'openbao'
 
+# Every user-facing openbao_* / erag_secrets_* key, checked once here (the
+# roles do not check them again). Skipped with secrets_backend: local and on
+# teardown (a removed openbao_ca_file must not block it; the openbao teardown
+# runs its own assert_mode.yaml).
+- name: "Preflight - Secrets backend: openbao settings"
+  ansible.builtin.include_tasks: preflight_secrets.yaml
+  when:
+    - (secrets_backend | default('local', true)) == 'openbao'
+    - (component_action | default('install')) != 'teardown'
+
 # ── CPU Policy Resolution ─────────────────────────────────────────────────────
 # Derive every CPU-pinning variable from the single `kubernetes_cpu_policy`
 # switch, so the operator never has to keep nri_cpu_balloons_enabled and the

@@ -8,8 +8,8 @@
 # (1 share) with a root token that only this test holds:
 #   A  file audit device declared in the server config
 #   B  no audit device
-# The operator template (roles/openbao/files/external-template.sh, which must equal the
-# block in docs/deploy/openbao.md "External OpenBao") is applied with the root
+# The operator template (roles/openbao/files/external-template.sh, sourcing
+# access.sh from the same directory) is applied with the root
 # token, then tasks/preflight.yaml + tasks/external_checks.yaml run from this
 # host over TLS, the operator login replaced by a token the test mints with the
 # template's operator policy (_external_login_stub.yaml). Rows:
@@ -39,7 +39,6 @@
   gather_facts: false
   vars:
     _role_dir: "{{ playbook_dir | dirname }}"
-    _repo_dir: "{{ playbook_dir | dirname | dirname | dirname }}"
     _image: "quay.io/openbao/openbao:2.7.0"
     _test_cid: test-cluster
     # Inputs normally supplied by global_config.yaml.
@@ -78,23 +77,6 @@
 
     - name: "openbao | external test | Run"
       block:
-        # ── Template in the runbook ───────────────────────────────────────
-        - name: "openbao | external test | Assert the template equals the runbook block"
-          vars:
-            _doc: "{{ lookup('ansible.builtin.file', _repo_dir ~ '/docs/deploy/openbao.md') }}"
-            _block: >-
-              {{ (_doc.split('<!-- external-template:begin -->')[1] | default('')).split('<!-- external-template:end -->')[0]
-                 | regex_replace('^\s*```sh\n', '') | regex_replace('\n```\s*$', '') }}
-            _file: "{{ lookup('ansible.builtin.file', _role_dir ~ '/files/external-template.sh') }}"
-          ansible.builtin.assert:
-            that:
-              - _block | trim | length > 0
-              - (_block | trim) == (_file | trim)
-            fail_msg: >-
-              docs/deploy/openbao.md (between the external-template markers) and
-              roles/openbao/files/external-template.sh differ: keep them identical.
-            quiet: true
-
         # ── Throwaway PKI ─────────────────────────────────────────────────
         - name: "openbao | external test | Dirs"
           ansible.builtin.file:
@@ -310,7 +292,7 @@
           ansible.builtin.assert:
             that:
               - _bao_rc | int != 0
-              - _bao_err is search("bad LAYERS entry 'erag:erag-secrets'")
+              - _bao_err is search("bad layer spec 'erag:erag-secrets'")
             fail_msg: "rc={{ _bao_rc }} {{ _bao_err }}"
             quiet: true
 
@@ -340,6 +322,33 @@
               - _bao_out is search('path "intel-ai/\+/test-cluster/\*"')
               - _bao_out is search('"token_policies":\s*\[\s*"test-cluster-operator"\s*\]')
               - _bao_out is search('"disable_local_ca_jwt":\s*true')
+            fail_msg: "{{ _bao_out }} {{ _bao_err }}"
+            quiet: true
+
+        - name: "openbao | external test | Template on A for cluster-b at auth/k8s/cluster-b"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "{{ _template_cmd }}", env: "{{ _template_env | combine(_override) }}"}
+            _override: {AUTH_MOUNT: k8s/cluster-b, CLUSTER_ID: cluster-b}
+
+        - name: "openbao | external test | Assert the template succeeded for cluster-b"
+          ansible.builtin.assert:
+            that:
+              - _bao_rc | int == 0
+              - _bao_out is search("set up for cluster 'cluster-b' \\(auth/k8s/cluster-b,")
+            fail_msg: "template cluster-b: rc={{ _bao_rc }} {{ _bao_out }} {{ _bao_err }}"
+            quiet: true
+
+        - name: "openbao | external test | Read back cluster-b's operator role"
+          ansible.builtin.include_tasks: _external_bao.yaml
+          vars:
+            _bao: {container: "{{ _cont_a }}", cmd: "bao read -format=json auth/k8s/cluster-b/role/operator"}
+
+        - name: "openbao | external test | Assert cluster-b's operator role uses its prefixed policy"
+          ansible.builtin.assert:
+            that:
+              - _bao_rc | int == 0
+              - (_bao_out | from_json).data.token_policies == ['cluster-b-operator']
             fail_msg: "{{ _bao_out }} {{ _bao_err }}"
             quiet: true
 

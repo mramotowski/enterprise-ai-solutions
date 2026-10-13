@@ -6,7 +6,9 @@
 #
 # Shipped in a ConfigMap mounted read-only into every OpenBao server pod and run
 # in pod 0 by tasks/bootstrap_exec.yaml (kubernetes.core.k8s_exec), and in
-# tests/bootstrap_test.yaml (docker exec). POSIX sh + the bao CLI only.
+# tests/bootstrap_test.yaml (docker exec). POSIX sh + the bao CLI only. The
+# mounts, policies and roles shared with external mode are in access.sh (same
+# ConfigMap, same directory).
 #
 #   /bin/sh bootstrap.sh <status|init|apply> <layer>:<namespace>:<worker_sa> ...
 #
@@ -23,8 +25,8 @@
 #           temporary token (generate-root) as the first line of stdin, then
 #           converges the KV mount, auth/kubernetes, its config, every AD-7
 #           policy and role (creating what is missing, rewriting the rest),
-#           checks the audit device, reads every role and policy back, and
-#           revokes the token (EXIT trap). Run by the operator, never by the
+#           checks the audit device and the bootstrap markers, and revokes the
+#           token (EXIT trap). Run by the operator, never by the
 #           installer: docs/deploy/openbao.md, "Change the bootstrap (generate-root)".
 #
 # Non-secret inputs only, through env (OB_*, plus the chart's BAO_ADDR and
@@ -82,10 +84,23 @@ OB_OPERATOR_SA=${OB_OPERATOR_SA:-openbao-operator}
 OB_OPERATOR_NAMESPACE=${OB_OPERATOR_NAMESPACE:-openbao}
 OB_OPERATOR_TOKEN_TTL=${OB_OPERATOR_TOKEN_TTL:-1h}
 OB_BACKUP_SA=${OB_BACKUP_SA:-openbao-snapshot}
-OB_BACKUP_NAMESPACE=${OB_BACKUP_NAMESPACE:-openbao}
+OB_BACKUP_NAMESPACE=${OB_BACKUP_NAMESPACE:-openbao-backup}
 OB_PEER_ADDRS=${OB_PEER_ADDRS:-}
 OB_TIMEOUT=${OB_TIMEOUT:-120}
 OB_K8S_HOST=${OB_K8S_HOST:-https://kubernetes.default.svc}
+
+# Inputs of the shared access writes (access.sh, next to this script).
+ACC_KV=$OB_KV_MOUNT
+ACC_CID=$OB_CLUSTER_ID
+ACC_AUTH=kubernetes
+ACC_PREFIX=
+ACC_LAYERS=$LAYERS
+ACC_AUDIENCE=$OB_AUDIENCE
+ACC_ESO_SA=$OB_ESO_SA
+ACC_ESO_NS=$OB_ESO_NAMESPACE
+ACC_OP_SA=$OB_OPERATOR_SA
+ACC_OP_NS=$OB_OPERATOR_NAMESPACE
+ACC_OP_TTL=$OB_OPERATOR_TOKEN_TTL
 
 # No bao call may hang the exec (and with it the EXIT trap) indefinitely:
 # 5s for status probes, longer for the calls that write (WRITE_TIMEOUT) and
@@ -196,77 +211,19 @@ bad() {
 	fail "$*"
 }
 
-is_uint() { case "$1" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
-
-# DNS-1123 label (namespaces): lower alnum and '-', alnum at both ends, <= 63.
-is_label() {
-	[ ${#1} -ge 1 ] && [ ${#1} -le 63 ] || return 1
-	case "$1" in *[!a-z0-9-]* | -* | *-) return 1 ;; esac
-}
-
-# DNS-1123 subdomain (ServiceAccount names): dot-separated labels, <= 253.
-is_subdomain() {
-	[ ${#1} -ge 1 ] && [ ${#1} -le 253 ] || return 1
-	case "$1" in .* | *. | *..*) return 1 ;; esac
-	old_ifs=$IFS
-	IFS=.
-	for part in $1; do
-		is_label "$part" || { IFS=$old_ifs; return 1; }
-	done
-	IFS=$old_ifs
-}
-
-# KV mount and cluster id: one path segment of [A-Za-z0-9._-], not . or ..
-is_segment() {
-	case "$1" in '' | . | .. | *[!A-Za-z0-9._-]*) return 1 ;; esac
-}
-
 # ── Parameters ───────────────────────────────────────────────────────────────
+# The mode, the timeout and every value written into a path, policy or role
+# (access.sh acc_params_ok, shared with external mode); apply is run by hand
+# with no installer preflight in front of it.
 
 check_params() {
 	STAGE=params
 	case "$MODE" in status | init | apply) ;; *) bad "unknown mode '$MODE' (status|init|apply)" ;; esac
-	if ! is_uint "$OB_KEY_SHARES" || ! is_uint "$OB_KEY_THRESHOLD" ||
-		[ "$OB_KEY_SHARES" -lt 1 ] || [ "$OB_KEY_SHARES" -gt 255 ] ||
-		[ "$OB_KEY_THRESHOLD" -lt 1 ] || [ "$OB_KEY_THRESHOLD" -gt "$OB_KEY_SHARES" ] ||
-		{ [ "$OB_KEY_SHARES" -gt 1 ] && [ "$OB_KEY_THRESHOLD" -lt 2 ]; }; then
-		bad "openbao_key_threshold ($OB_KEY_THRESHOLD) must be >= 1 and <= openbao_key_shares ($OB_KEY_SHARES), >= 2 when there is more than one share, and openbao_key_shares must be 1..255"
-	fi
-	{ is_uint "$OB_TIMEOUT" && [ "$OB_TIMEOUT" -ge 2 ]; } || bad "OB_TIMEOUT must be a number of seconds >= 2 (got '$OB_TIMEOUT')"
-	is_segment "$OB_KV_MOUNT" || bad "OB_KV_MOUNT must be one path segment of [A-Za-z0-9._-], not . or .. (got '$OB_KV_MOUNT')"
-	is_segment "$OB_CLUSTER_ID" || bad "OB_CLUSTER_ID must be one path segment of [A-Za-z0-9._-], not . or .. (got '$OB_CLUSTER_ID')"
-	is_segment "$OB_AUDIENCE" || bad "OB_AUDIENCE must be a name of [A-Za-z0-9._-] (got '$OB_AUDIENCE')"
-	for v in OB_ESO_NAMESPACE OB_OPERATOR_NAMESPACE OB_BACKUP_NAMESPACE; do
-		eval "val=\${$v}"
-		# shellcheck disable=SC2154
-		is_label "$val" || bad "$v must be a DNS-1123 label (got '$val')"
-	done
-	for v in OB_ESO_SA OB_OPERATOR_SA OB_BACKUP_SA; do
-		eval "val=\${$v}"
-		is_subdomain "$val" || bad "$v must be a DNS-1123 subdomain (got '$val')"
-	done
-	case "$OB_OPERATOR_TOKEN_TTL" in
-	'' | *[!0-9smh]* | [!0-9]*) bad "OB_OPERATOR_TOKEN_TTL must be a duration like 1h or 30m (got '$OB_OPERATOR_TOKEN_TTL')" ;;
-	esac
-	case "$OB_K8S_HOST" in
-	https://?* ) case "$OB_K8S_HOST" in *[!A-Za-z0-9.:/_-]*) bad "OB_K8S_HOST must be an https:// URL (got '$OB_K8S_HOST')" ;; esac ;;
-	*) bad "OB_K8S_HOST must be an https:// URL (got '$OB_K8S_HOST')" ;;
-	esac
-	for a in $OB_PEER_ADDRS; do
-		case "$a" in
-		http://?*:[0-9]* | https://?*:[0-9]*) case "$a" in *[!A-Za-z0-9.:/-]*) bad "bad peer address '$a'" ;; esac ;;
-		*) bad "bad peer address '$a' (http[s]://<host>:<port>)" ;;
-		esac
-	done
+	case "$OB_TIMEOUT" in '' | *[!0-9]*) bad "OB_TIMEOUT must be a number of seconds (got '$OB_TIMEOUT')" ;; esac
 	[ -n "$LAYERS" ] || bad "no layers given (<layer>:<namespace>:<worker_sa>)"
-	for spec in $LAYERS; do
-		case "$spec" in *:*:*:* | :* | *::* | *:) bad "bad layer spec '$spec' (<layer>:<namespace>:<worker_sa>)" ;; *:*:*) ;; *) bad "bad layer spec '$spec' (<layer>:<namespace>:<worker_sa>)" ;; esac
-		l=${spec%%:*}
-		rest=${spec#*:}
-		is_label "$l" || bad "bad layer name '$l' in '$spec'"
-		is_label "${rest%%:*}" || bad "bad worker namespace in '$spec' (DNS-1123 label)"
-		is_subdomain "${rest#*:}" || bad "bad worker ServiceAccount in '$spec' (DNS-1123 subdomain)"
-	done
+	acc_params_ok || bad "$ACC_BAD"
+	acc_dns "$OB_BACKUP_NAMESPACE" || bad "OB_BACKUP_NAMESPACE must be a DNS-1123 label (got '$OB_BACKUP_NAMESPACE')"
+	acc_dns "$OB_BACKUP_SA" dots || bad "OB_BACKUP_SA must be a DNS-1123 subdomain (got '$OB_BACKUP_SA')"
 }
 
 # ── State detection (unauthenticated endpoints only) ─────────────────────────
@@ -430,9 +387,10 @@ unseal() {
 	return 1
 }
 
-# as_root <stage> <bao args...>: one bao call with the root token; on failure
-# record the stage and bao's error text (bao errors never echo the token).
-as_root() {
+# Hooks for access.sh. bao_write <stage> <bao args...>: one bao call with the
+# root token; on failure record the stage and bao's error text (bao errors
+# never echo the token).
+bao_write() {
 	STAGE=$1
 	shift
 	if ! e=$(BAO_CLIENT_TIMEOUT=$WRITE_TIMEOUT BAO_TOKEN="$ROOT" bao "$@" 2>&1 >/dev/null); then
@@ -441,131 +399,27 @@ as_root() {
 		return 1
 	fi
 }
-
-# put_policy <name>: policy HCL on stdin.
-put_policy() {
-	STAGE="policy $1"
-	if ! e=$(BAO_CLIENT_TIMEOUT=$WRITE_TIMEOUT BAO_TOKEN="$ROOT" bao policy write "$1" - 2>&1 >/dev/null); then
-		ERR="$STAGE: $(printf '%s' "$e" | grep -v '^ *$' | tail -n 3)"
-		log "$ERR"
-		return 1
-	fi
+bao_read() { BAO_CLIENT_TIMEOUT=$WRITE_TIMEOUT BAO_TOKEN="$ROOT" bao "$@" 2>/dev/null; }
+acc_fail() {
+	ERR=$*
+	STAGE=${ERR%%:*}
+	log "$ERR"
+	return 1
 }
 
-# Init (a fresh server): create the KV mount and Kubernetes auth, then the rest.
+# Init and apply: the KV mount and auth/kubernetes (created when missing), its
+# config, the AD-7 policies and roles (access.sh), role backup and the audit
+# device check. Writes are full rewrites, so running this again converges.
 bootstrap() {
-	m=$OB_KV_MOUNT
-
-	as_root "kv mount" secrets enable -path="$m" -version=2 kv || return 1
+	acc_mounts || return 1
 	# Lets the tokenless re-run check see the mount (name and type only).
-	as_root "kv mount visibility" secrets tune -listing-visibility=unauth "$m/" || return 1
-
-	as_root "auth enable" auth enable kubernetes || return 1
-	as_root "auth config" write auth/kubernetes/config \
+	bao_write "kv mount visibility" secrets tune -listing-visibility=unauth "$OB_KV_MOUNT/" || return 1
+	bao_write "auth config" write auth/kubernetes/config \
 		kubernetes_host="$OB_K8S_HOST" disable_local_ca_jwt=false || return 1
 
-	bootstrap_access
-}
+	acc_policies || return 1
 
-# Apply: the same mount and auth, created only when missing; an existing one of
-# the wrong kind is an error, never replaced (it may hold data).
-apply_mounts() {
-	m=$OB_KV_MOUNT
-
-	STAGE="kv mount"
-	mounts=$(BAO_TOKEN="$ROOT" bao secrets list -format=json 2>/dev/null | tr -d ' \n\r\t')
-	[ -n "$mounts" ] || { ERR="kv mount: cannot list secrets engines with the token"; log "$ERR"; return 1; }
-	case "$mounts" in
-	*"\"$m/\":{"*)
-		info=$(BAO_TOKEN="$ROOT" bao read -format=json "sys/mounts/$m" 2>/dev/null | tr -d ' \n\r\t')
-		case "$info" in
-		*'"type":"kv"'*) ;;
-		*) ERR="kv mount: $m/ exists but is not a kv secrets engine; fix it by hand"; log "$ERR"; return 1 ;;
-		esac
-		case "$info" in
-		*'"version":"2"'*) ;;
-		*) ERR="kv mount: $m/ exists but is not KV version 2; fix it by hand"; log "$ERR"; return 1 ;;
-		esac
-		;;
-	*) as_root "kv mount" secrets enable -path="$m" -version=2 kv || return 1 ;;
-	esac
-	as_root "kv mount visibility" secrets tune -listing-visibility=unauth "$m/" || return 1
-
-	STAGE="auth enable"
-	auths=$(BAO_TOKEN="$ROOT" bao auth list -format=json 2>/dev/null | tr -d ' \n\r\t')
-	[ -n "$auths" ] || { ERR="auth enable: cannot list auth methods with the token"; log "$ERR"; return 1; }
-	case "$auths" in
-	*'"kubernetes/":{'*)
-		case "$(BAO_TOKEN="$ROOT" bao read -format=json sys/auth/kubernetes 2>/dev/null | tr -d ' \n\r\t')" in
-		*'"type":"kubernetes"'*) ;;
-		*) ERR="auth enable: auth/kubernetes exists but is not a kubernetes auth method; fix it by hand"; log "$ERR"; return 1 ;;
-		esac
-		;;
-	*) as_root "auth enable" auth enable kubernetes || return 1 ;;
-	esac
-	as_root "auth config" write auth/kubernetes/config \
-		kubernetes_host="$OB_K8S_HOST" disable_local_ca_jwt=false || return 1
-}
-
-# Policies and roles (AD-7) and the audit device check. Writes are full
-# rewrites, so running this again converges every policy and role.
-bootstrap_access() {
-	m=$OB_KV_MOUNT
-	c=$OB_CLUSTER_ID
-
-	for spec in $LAYERS; do
-		l=${spec%%:*}
-		rest=${spec#*:}
-		wns=${rest%%:*}
-		wsa=${rest#*:}
-
-		put_policy "eso-$l" <<EOF || return 1
-path "$m/data/$c/$l/*" {
-  capabilities = ["read"]
-}
-EOF
-		as_root "role eso-$l" write "auth/kubernetes/role/eso-$l" \
-			bound_service_account_names="$OB_ESO_SA" bound_service_account_namespaces="$OB_ESO_NAMESPACE" \
-			token_policies="eso-$l" audience="$OB_AUDIENCE" || return 1
-
-		put_policy "$l-secrets-worker" <<EOF || return 1
-path "$m/data/$c/$l/*" {
-  capabilities = ["create", "update", "read", "delete"]
-}
-path "$m/metadata/$c/$l/*" {
-  capabilities = ["read", "list", "delete"]
-}
-EOF
-		as_root "role $l-secrets-worker" write "auth/kubernetes/role/$l-secrets-worker" \
-			bound_service_account_names="$wsa" bound_service_account_namespaces="$wns" \
-			token_policies="$l-secrets-worker" audience="$OB_AUDIENCE" || return 1
-
-		put_policy "$l-secrets-importer" <<EOF || return 1
-path "$m/data/$c/$l/*" {
-  capabilities = ["create", "update", "read"]
-}
-EOF
-		as_root "role $l-secrets-importer" write "auth/kubernetes/role/$l-secrets-importer" \
-			bound_service_account_names="$l-secrets-importer" bound_service_account_namespaces="$wns" \
-			token_policies="$l-secrets-importer" audience="$OB_AUDIENCE" || return 1
-	done
-
-	# '+' is one path segment (data, metadata, ...): ACL globs only work at the end.
-	# Listing audit devices (GET sys/audit) is a sudo path: read alone gets 403.
-	put_policy operator <<EOF || return 1
-path "$m/+/$c/*" {
-  capabilities = ["read", "create", "update", "list"]
-}
-path "sys/audit" {
-  capabilities = ["read", "sudo"]
-}
-EOF
-	as_root "role operator" write auth/kubernetes/role/operator \
-		bound_service_account_names="$OB_OPERATOR_SA" bound_service_account_namespaces="$OB_OPERATOR_NAMESPACE" \
-		token_policies=operator audience="$OB_AUDIENCE" \
-		token_ttl="$OB_OPERATOR_TOKEN_TTL" token_max_ttl="$OB_OPERATOR_TOKEN_TTL" || return 1
-
-	put_policy backup <<EOF || return 1
+	acc_policy backup <<EOF || return 1
 path "sys/storage/raft/snapshot" {
   capabilities = ["read"]
 }
@@ -573,61 +427,23 @@ path "sys/storage/raft/snapshot-force" {
   capabilities = ["update"]
 }
 EOF
-	as_root "role backup" write auth/kubernetes/role/backup \
-		bound_service_account_names="$OB_BACKUP_SA" bound_service_account_namespaces="$OB_BACKUP_NAMESPACE" \
-		token_policies=backup audience="$OB_AUDIENCE" || return 1
+	acc_role backup "$OB_BACKUP_SA" "$OB_BACKUP_NAMESPACE" || return 1
 
 	# The file audit device to stdout is declared in the server config (OpenBao
 	# 2.7 refuses audit devices created through the API); make sure it is active.
 	STAGE="audit device"
-	audit=$(BAO_TOKEN="$ROOT" bao audit list -format=json 2>/dev/null | tr -d ' \n\r\t')
+	audit=$(bao_read audit list -format=json 2>/dev/null | tr -d ' \n\r\t')
 	case "$audit" in
 	*'"type":"file"'*) ;;
-	*) ERR="audit device: no file audit device is enabled (expected the server config audit \"file\" stanza)"; log "$ERR"; return 1 ;;
+	*) acc_fail "audit device: no file audit device is enabled (expected the server config audit \"file\" stanza)"; return 1 ;;
 	esac
 	case "$audit" in
 	*'"file_path":"stdout"'*) ;;
-	*) ERR="audit device: the file audit device does not write to stdout"; log "$ERR"; return 1 ;;
+	*) acc_fail "audit device: the file audit device does not write to stdout"; return 1 ;;
 	esac
 
 	STAGE=done
 	BOOT_OK=true
-}
-
-# check_role <role> <sa> <namespace> <policy>: the role exists with exactly this
-# binding, policy and audience (apply mode, read back with the token).
-check_role() {
-	r=$(BAO_TOKEN="$ROOT" bao read -format=json "auth/kubernetes/role/$1" 2>/dev/null | tr -d ' \n\r\t')
-	case "$r" in
-	*"\"bound_service_account_names\":[\"$2\"]"*) ;;
-	*) printf '%s' " role:$1(binding)"; return ;;
-	esac
-	case "$r" in *"\"bound_service_account_namespaces\":[\"$3\"]"*) ;; *) printf '%s' " role:$1(namespace)"; return ;; esac
-	case "$r" in *"\"token_policies\":[\"$4\"]"*) ;; *) printf '%s' " role:$1(policy)"; return ;; esac
-	case "$r" in *"\"audience\":\"$OB_AUDIENCE\""*) ;; *) printf '%s' " role:$1(audience)"; return ;; esac
-	BAO_TOKEN="$ROOT" bao policy read "$4" >/dev/null 2>&1 || printf '%s' " policy:$4"
-}
-
-verify_access() {
-	STAGE=verify
-	bad=
-	for spec in $LAYERS; do
-		l=${spec%%:*}
-		rest=${spec#*:}
-		wns=${rest%%:*}
-		wsa=${rest#*:}
-		bad="$bad$(check_role "eso-$l" "$OB_ESO_SA" "$OB_ESO_NAMESPACE" "eso-$l")"
-		bad="$bad$(check_role "$l-secrets-worker" "$wsa" "$wns" "$l-secrets-worker")"
-		bad="$bad$(check_role "$l-secrets-importer" "$l-secrets-importer" "$wns" "$l-secrets-importer")"
-	done
-	bad="$bad$(check_role operator "$OB_OPERATOR_SA" "$OB_OPERATOR_NAMESPACE" operator)"
-	bad="$bad$(check_role backup "$OB_BACKUP_SA" "$OB_BACKUP_NAMESPACE" backup)"
-	if [ -n "$bad" ]; then
-		MISSING=$bad
-		ERR="verify: read back differs:$bad"
-		log "$ERR"
-		return 1
-	fi
 }
 
 # ── Apply run ────────────────────────────────────────────────────────────────
@@ -657,7 +473,7 @@ do_apply() {
 	ROOT_ACC=$(BAO_TOKEN="$ROOT" bao token lookup -format=json 2>/dev/null | tr -d ' \n\r\t' |
 		sed -n 's/.*"accessor":"\([^"]*\)".*/\1/p')
 	BOOT_OK=false
-	if ! apply_mounts || ! bootstrap_access || ! verify_access; then
+	if ! bootstrap; then
 		STATE=apply_failed
 		BOOT_OK=false
 		exit 1
@@ -751,6 +567,10 @@ do_init() {
 }
 
 # Sealed, mixed and unreachable states exit here (through the EXIT trap).
+case "$0" in */*) ACC_DIR=${0%/*} ;; *) ACC_DIR=. ;; esac
+[ -r "$ACC_DIR/access.sh" ] || { STATE=bad_params; fail "cannot read $ACC_DIR/access.sh"; }
+# shellcheck source=access.sh
+. "$ACC_DIR/access.sh"
 check_params
 detect
 if [ "$MODE" = init ] && [ "$STATE" = uninitialized ]; then
